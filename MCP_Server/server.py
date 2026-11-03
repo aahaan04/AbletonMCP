@@ -496,10 +496,10 @@ def get_clip_notes(
     try:
         from .script_handshake import require_capability
 
-        missing = require_capability("get_clip_notes")
+        ableton = get_ableton_connection()
+        missing = require_capability("get_clip_notes", ableton.send_command)
         if missing:
             return missing
-        ableton = get_ableton_connection()
         result = ableton.send_command(
             "get_clip_notes",
             {"track_index": track_index, "clip_index": clip_index},
@@ -606,10 +606,10 @@ def get_session_snapshot(
     try:
         from .script_handshake import require_capability
 
-        missing = require_capability("get_session_snapshot")
+        ableton = get_ableton_connection()
+        missing = require_capability("get_session_snapshot", ableton.send_command)
         if missing:
             return missing
-        ableton = get_ableton_connection()
         result = ableton.send_command(
             "get_session_snapshot",
             {
@@ -797,10 +797,10 @@ def clear_notes_from_clip(
     try:
         from .script_handshake import require_capability
 
-        missing = require_capability("clear_notes_from_clip")
+        ableton = get_ableton_connection()
+        missing = require_capability("clear_notes_from_clip", ableton.send_command)
         if missing:
             return missing
-        ableton = get_ableton_connection()
         result = ableton.send_command("clear_notes_from_clip", {
             "track_index": track_index,
             "clip_index": clip_index
@@ -983,10 +983,10 @@ def delete_clip(ctx: Context, track_index: int, clip_index: int, user_prompt: st
     try:
         from .script_handshake import require_capability
 
-        missing = require_capability("delete_clip")
+        ableton = get_ableton_connection()
+        missing = require_capability("delete_clip", ableton.send_command)
         if missing:
             return missing
-        ableton = get_ableton_connection()
         result = ableton.send_command("delete_clip", {
             "track_index": track_index,
             "clip_index": clip_index,
@@ -1328,10 +1328,10 @@ def create_locator(
     try:
         from .script_handshake import require_capability
 
-        missing = require_capability("create_locator")
+        ableton = get_ableton_connection()
+        missing = require_capability("create_locator", ableton.send_command)
         if missing:
             return missing
-        ableton = get_ableton_connection()
         result = ableton.send_command(
             "create_locator",
             {"name": name, "time": time}

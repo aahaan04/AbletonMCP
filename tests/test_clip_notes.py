@@ -91,7 +91,7 @@ def _script_capabilities_available(monkeypatch):
     handshake. Report every capability as present so the tests exercise the
     tool body rather than the missing-script early return."""
     import MCP_Server.script_handshake as sh
-    monkeypatch.setattr(sh, "require_capability", lambda name: None)
+    monkeypatch.setattr(sh, "require_capability", lambda name, send_command=None: None)
 
 
 # A representative clip payload as the Remote Script would return it.

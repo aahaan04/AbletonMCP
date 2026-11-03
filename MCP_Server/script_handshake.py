@@ -112,10 +112,21 @@ def handshake(send_command) -> dict[str, Any]:
     return info
 
 
-def require_capability(name: str) -> str | None:
-    """Return an error message if capability missing, else None."""
+def require_capability(name: str, send_command=None) -> str | None:
+    """Return an error message if capability missing, else None.
+
+    The startup handshake runs once, when the MCP host launches the server —
+    often before Live is open. A failed or stale handshake must not lock out a
+    capability for the whole session, so when ``send_command`` is given and the
+    cached info lacks ``name``, re-handshake against the live Remote Script
+    before refusing.
+    """
     if script_has_capability(name):
         return None
+    if send_command is not None:
+        handshake(send_command)  # never raises; failures land in info["error"]
+        if script_has_capability(name):
+            return None
     info = get_cached_script_info() or {}
     return (
         f"Ableton Remote Script missing capability '{name}' "

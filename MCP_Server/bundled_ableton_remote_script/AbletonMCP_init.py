@@ -327,7 +327,8 @@ class AbletonMCP(ControlSurface):
                                  "set_nested_device_parameter",
                                  # Deletes
                                  "delete_track", "delete_return_track",
-                                 "delete_device", "delete_nested_device"]:
+                                 "delete_device", "delete_nested_device",
+                                 "create_return_track"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -391,6 +392,8 @@ class AbletonMCP(ControlSurface):
                                 params.get("clip_index", 0),
                                 view=params.get("view", "session"),
                                 expected_name=params.get("expected_name"))
+                        elif command_type == "create_return_track":
+                            result = self._create_return_track()
                         elif command_type == "delete_track":
                             result = self._delete_track(
                                 params.get("track_index"), params.get("expected_name"))
@@ -755,6 +758,20 @@ class AbletonMCP(ControlSurface):
             return result
         except Exception as e:
             self.log_message("Error creating MIDI track: " + str(e))
+            raise
+
+    def _create_return_track(self):
+        """Create a return track at the end. Returns its index."""
+        try:
+            self._song.create_return_track()
+            n = len(self._song.return_tracks)
+            return {
+                "created": True,
+                "return_track_index": n - 1,
+                "return_track_count": n,
+            }
+        except Exception as e:
+            self.log_message("Error creating return track: " + str(e))
             raise
 
     def _create_audio_track(self, index):

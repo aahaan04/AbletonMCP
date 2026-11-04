@@ -1957,6 +1957,21 @@ def set_nested_device_parameter(
         logger.error(f"Error setting nested device parameter: {str(e)}")
         return f"Error setting nested device parameter: {str(e)}"
 
+@mcp.tool()
+def create_return_track(ctx: Context) -> str:
+    """
+    Create a return track at the end of the session.
+
+    Returns the index of the newly created return track.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_return_track", {})
+        return f"Created return track at index {result.get('return_track_index')} (total returns: {result.get('return_track_count')})"
+    except Exception as e:
+        logger.error(f"Error creating return track: {str(e)}")
+        return f"Error creating return track: {str(e)}"
+
 # ── Delete tools ──────────────────────────────────────────────────────────────
 # One target per call, by explicit index. Indexes after the deleted item shift
 # down, so re-read (get_session_info / get_track_info) before the next delete,

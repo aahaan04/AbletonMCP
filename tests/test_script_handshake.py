@@ -67,9 +67,7 @@ def _hermetic(monkeypatch):
         def record_event(self, *a, **k):
             pass
     import MCP_Server.telemetry_decorator as td
-    import MCP_Server.dataset.consent as consent
     monkeypatch.setattr(td, "get_telemetry", lambda: _Dummy(), raising=False)
-    monkeypatch.setattr(consent, "maybe_consent_notice", lambda: "")
 
 
 def test_without_handshake_capability_is_refused():

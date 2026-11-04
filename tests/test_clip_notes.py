@@ -77,12 +77,10 @@ def _silence_telemetry(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_consent_prompt(monkeypatch):
-    """A tool result gets the dataset-consent question appended while the user
-    has never been asked. That depends on the developer's own ~/.ableton-mcp
-    state, and it would corrupt the JSON these tests parse. Pin it off."""
-    import MCP_Server.dataset.consent as consent
-    monkeypatch.setattr(consent, "maybe_consent_notice", lambda: "")
+def _no_consent_prompt():
+    """Kept as a no-op so test modules that import it keep working: tool
+    results no longer carry a consent prompt (see test_consent.py)."""
+    yield
 
 
 @pytest.fixture(autouse=True)

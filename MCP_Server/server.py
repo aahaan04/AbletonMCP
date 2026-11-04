@@ -270,8 +270,19 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         logger.info("AbletonMCP server shut down")
 
 # Create the MCP server with lifespan support
+def _server_instructions() -> str:
+    from .dataset.consent import CONSENT_INFO
+
+    return (
+        "Controls Ableton Live through its Remote Script. For notes, prefer the "
+        "compact tools (create_clip with notes, write_drum_pattern, compact note "
+        "arrays with repeat) over long per-note JSON. " + CONSENT_INFO
+    )
+
+
 mcp = FastMCP(
     "AbletonMCP",
+    instructions=_server_instructions(),
     lifespan=server_lifespan
 )
 

@@ -634,6 +634,223 @@ def cmd_selftest_meters(client: Client, via_server: bool) -> int:
     return c.finish()
 
 
+# --------------------------------------------------------------------------
+# selftest-arrangement: 3-section layout on two tracks, envelope carried,
+# loop and locators, read back, refusals
+# --------------------------------------------------------------------------
+
+def _raw_toggle_locator(client: Client, beat: float):
+    """What the server's set_locator/delete_locator do: playhead move, then
+    toggle, as separate commands so Live applies the move in between."""
+    restore = client.send("get_session_info")["current_song_time"]
+    client.send("set_current_song_time", {"time": beat})
+    time.sleep(0.15)
+    try:
+        playhead = client.send("toggle_cue_at_playhead")["playhead"]
+        if abs(playhead - beat) > 0.01:
+            raise CommandError(f"cue toggled at beat {playhead}, not {beat}")
+        time.sleep(0.15)
+    finally:
+        client.send("set_current_song_time", {"time": restore})
+
+
+def set_locator(client: Client, ops, via_server: bool, name: str, bar: float):
+    if via_server:
+        return ops.run("set_locator", name=name, bar=bar)
+    beat = (bar - 1) * client.send("get_locators")["beats_per_bar"]
+    _raw_toggle_locator(client, beat)
+    return client.send("rename_locator", {"time": beat, "name": name})
+
+
+def delete_locator(client: Client, ops, via_server: bool, bar: float, name: str):
+    if via_server:
+        return ops.run("delete_locator", bar=bar, expected_name=name)
+    beat = (bar - 1) * client.send("get_locators")["beats_per_bar"]
+    cue = next((c for c in client.send("get_locators")["locators"] if abs(c["time"] - beat) < 0.01), None)
+    if cue is None or cue["name"] != name:
+        raise CommandError(f"no locator {name!r} at bar {bar}")
+    _raw_toggle_locator(client, beat)
+
+
+SECTIONS = (("ableton_cli Intro", 1, 8), ("ableton_cli Main", 9, 16), ("ableton_cli Outro", 17, 24))
+
+
+def cmd_selftest_arrangement(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    before = client.send("get_arrangement_layout", {"track_indexes": []})
+    bpb = before["beats_per_bar"]
+    taken = {l["bar"] for l in before["locators"]}
+    if any(float(bar) in taken for _, bar, _ in SECTIONS):
+        print("selftest-arrangement: a locator already sits at bar 1, 9 or 17; not touching it")
+        return 1
+    loop0 = before["loop"]
+    placed_locators = []
+    with temp_track(client, "ableton_cli temp A") as a, temp_track(client, "ableton_cli temp B") as b:
+        # A: 2-bar intro, 4-bar main, 2-bar outro. B: 4-bar intro with a filter sweep, 2-bar main.
+        for slot, bars, name in ((0, 2, "intro A"), (1, 4, "main A"), (2, 2, "outro A")):
+            client.send("create_clip", {"track_index": a, "clip_index": slot, "length": bars * bpb})
+            client.send("set_clip_name", {"track_index": a, "clip_index": slot, "name": name})
+        for slot, bars, name in ((0, 4, "intro B"), (1, 2, "main B")):
+            client.send("create_clip", {"track_index": b, "clip_index": slot, "length": bars * bpb})
+            client.send("set_clip_name", {"track_index": b, "clip_index": slot, "name": name})
+        client.send("load_browser_item", {"track_index": b, "item_uri": browser_uri(client, "audio_effects", "Auto Filter")})
+        freq = _pick_param(client.send("get_device_parameters", {"track_index": b, "device_index": 0})
+                           ["device"]["parameters"], ("Frequency",))
+        cutoff = {"device_index": 0, "parameter_name": freq["name"].strip()}
+        client.send("write_clip_automation", {"track_index": b, "clip_index": 0, "target": cutoff,
+                                              "points": [{"time": 0, "normalized": 0.2},
+                                                         {"time": 4 * bpb, "normalized": 0.8}]})
+        print(f"selftest-arrangement via {ops.label}: temp tracks {a} and {b}, "
+              f"sections bars 1-8 / 9-16 / 17-24")
+        try:
+            ops.run("fill_arrangement_section", start_bar=1, end_bar=8,
+                    placements=[{"track_index": a, "clip_index": 0}, {"track_index": b, "clip_index": 0}])
+            ops.run("fill_arrangement_section", start_bar=9, end_bar=16,
+                    placements=[{"track_index": a, "clip_index": 1}, {"track_index": b, "clip_index": 1}])
+            ops.run("fill_arrangement", track_index=a, clip_index=2, start_bar=17, end_bar=24)
+
+            layout = ops.run("get_arrangement_layout", track_indexes=[a, b])
+            ta, tb = layout["tracks"]
+            got_a = [(cl["name"], cl["start_bar"], cl["end_bar"]) for cl in ta["clips"]]
+            got_b = [(cl["name"], cl["start_bar"], cl["end_bar"]) for cl in tb["clips"]]
+            want_a = ([("intro A", s, s + 1) for s in (1, 3, 5, 7)] + [("main A", s, s + 3) for s in (9, 13)]
+                      + [("outro A", s, s + 1) for s in (17, 19, 21, 23)])
+            want_b = [("intro B", s, s + 3) for s in (1, 5)] + [("main B", s, s + 1) for s in (9, 11, 13, 15)]
+            c.check("track A positions", got_a == want_a and not ta["gaps"] and not ta["overlaps"],
+                    f"{len(got_a)} clips, bars {got_a[0][1]:g}-{got_a[-1][2]:g}")
+            c.check("track B positions", got_b == want_b and not tb["gaps"] and not tb["overlaps"],
+                    f"{len(got_b)} clips, bars {got_b[0][1]:g}-{got_b[-1][2]:g}")
+
+            env = ops.run("get_clip_automation", track_index=b, clip_index=1, target=cutoff,
+                          view="arrangement", times=[0, 8, 15.9])
+            vals = [s["value"] for s in env.get("samples", [])]
+            c.check("envelope carried over", env["has_envelope"] and len(vals) == 3 and vals == sorted(vals)
+                    and vals[0] < vals[-1], ", ".join(s["display"] for s in env.get("samples", [])))
+
+            try:
+                ops.run("fill_arrangement", track_index=a, clip_index=0, start_bar=9, end_bar=10)
+                c.check("occupied range refused", False, "placed over main A")
+            except CommandError as e:
+                c.check("occupied range refused", "already has clips" in str(e))
+            try:
+                ops.run("fill_arrangement", track_index=b, clip_index=0, start_bar=25, end_bar=30)
+                c.check("partial repeat refused", False, "placed 6 bars of a 4-bar clip")
+            except CommandError as e:
+                c.check("partial repeat refused", "whole number of repeats" in str(e))
+
+            for name, bar, _ in SECTIONS:
+                set_locator(client, ops, via_server, name, bar)
+                placed_locators.append((bar, name))
+            ops.run("set_arrangement_loop", start_bar=9, end_bar=16)
+            layout = ops.run("get_arrangement_layout", track_indexes=[])
+            locs = {(l["name"], l["bar"]) for l in layout["locators"]}
+            c.check("locators", all((n, float(bar)) in locs for n, bar, _ in SECTIONS),
+                    ", ".join(f"{n.split()[-1]}@{bar}" for n, bar, _ in SECTIONS))
+            lp = layout["loop"]
+            c.check("loop bars 9-16", lp["enabled"] and (lp["start_bar"], lp["end_bar"]) == (9, 16),
+                    f"{lp['start_bar']:g}-{lp['end_bar']:g}")
+        except CommandError as e:
+            c.check("arrangement commands", False, str(e))
+        finally:
+            for bar, name in reversed(placed_locators):
+                delete_locator(client, ops, via_server, bar, name)
+            client.send("set_arrangement_loop", {"start_bar": loop0["start_bar"], "end_bar": loop0["end_bar"],
+                                                 "enabled": loop0["enabled"]})
+    after = client.send("get_arrangement_layout", {"track_indexes": []})
+    c.check("cleaned up", after["locators"] == before["locators"] and after["loop"] == loop0,
+            f"{len(after['locators'])} locators, loop {after['loop']['start_bar']:g}-{after['loop']['end_bar']:g}")
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-noteedit: pattern -> transpose / velocity / shift / delete -> exact
+# --------------------------------------------------------------------------
+
+def cmd_selftest_noteedit(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    pattern = ([{"pitch": 36, "start_time": t, "duration": 0.25, "velocity": 100} for t in (0.0, 2.0)]
+               + [{"pitch": 38, "start_time": t, "duration": 0.25, "velocity": 110} for t in (1.0, 3.0)]
+               + [{"pitch": 42, "start_time": i * 0.5, "duration": 0.125, "velocity": 80} for i in range(8)])
+    with temp_track(client) as track:
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+        client.send("add_notes_to_clip", {"track_index": track, "clip_index": 0, "notes": pattern})
+        print(f"selftest-noteedit via {ops.label}: temp track {track}, 12-note drum pattern")
+        try:
+            notes = client.send("get_clip_notes", {"track_index": track, "clip_index": 0})["notes"]
+            ids = {(n["pitch"], n["start_time"]): n["note_id"] for n in notes}
+            kicks = [ids[(36, 0.0)], ids[(36, 2.0)]]
+            ops.run("modify_notes", track_index=track, clip_index=0,
+                    selection={"note_ids": kicks}, changes={"transpose": 2})
+            ops.run("modify_notes", track_index=track, clip_index=0,
+                    selection={"pitch_min": 42, "pitch_max": 42, "time_min": 0.5, "time_max": 4},
+                    changes={"velocity_delta": -30})
+            ops.run("modify_notes", track_index=track, clip_index=0,
+                    selection={"note_ids": [ids[(42, 3.5)]]}, changes={"shift": -0.25, "duration": 0.25})
+            ops.run("delete_notes", track_index=track, clip_index=0, selection={"note_ids": [ids[(38, 3.0)]]})
+            try:
+                ops.run("modify_notes", track_index=track, clip_index=0,
+                        selection={"pitch_min": 36, "pitch_max": 38}, changes={"transpose": 100})
+                c.check("invalid edit refused", False, "pitch 136 accepted")
+            except CommandError as e:
+                c.check("invalid edit refused", "pitch" in str(e))
+
+            after = client.send("get_clip_notes", {"track_index": track, "clip_index": 0})["notes"]
+            got = sorted((n["pitch"], round(n["start_time"], 4), round(n["duration"], 4), int(n["velocity"]))
+                         for n in after)
+            want = sorted([(38, 0.0, 0.25, 100), (38, 2.0, 0.25, 100), (38, 1.0, 0.25, 110)]
+                          + [(42, 0.0, 0.125, 80)]
+                          + [(42, i * 0.5, 0.125, 50) for i in range(1, 7)] + [(42, 3.25, 0.25, 50)])
+            c.check("exact result", got == want, f"{len(got)} notes")
+            kept = {n["note_id"] for n in after}
+            c.check("note ids kept", set(kicks) <= kept and ids[(38, 3.0)] not in kept,
+                    "kicks keep ids after transpose; deleted snare gone")
+        except CommandError as e:
+            c.check("note edit commands", False, str(e))
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-grooves: swing groove on a hat clip -> read back -> remove
+# --------------------------------------------------------------------------
+
+SWING_GROOVE = "Swing MPC 3000 8ths 57"
+
+
+def cmd_selftest_grooves(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    with temp_track(client) as track:
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+        client.send("add_notes_to_clip", {"track_index": track, "clip_index": 0, "notes": [
+            {"pitch": 42, "start_time": i * 0.5, "duration": 0.125, "velocity": 90} for i in range(8)]})
+        pool0 = client.send("get_groove_pool")
+        print(f"selftest-grooves via {ops.label}: temp track {track}, hat 8ths, "
+              f"pool has {len(pool0['grooves'])} groove(s)")
+        try:
+            loaded = ops.run("load_groove", name=SWING_GROOVE)
+            pool = client.send("get_groove_pool")["grooves"]
+            index = next(g["index"] for g in pool if g["name"] == SWING_GROOVE)
+            c.check("load_groove", True, f"{SWING_GROOVE!r} at pool index {index}"
+                    + ("" if len(pool) > len(pool0["grooves"]) else ", was already in the pool"))
+
+            ops.run("assign_groove", track_index=track, clip_index=0, groove_index=index)
+            clip = client.send("get_track_info", {"track_index": track})["clip_slots"][0]["clip"]
+            c.check("assigned", clip.get("groove") == SWING_GROOVE, str(clip.get("groove")))
+
+            ops.run("assign_groove", track_index=track, clip_index=0, remove=True)
+            clip = client.send("get_track_info", {"track_index": track})["clip_slots"][0]["clip"]
+            c.check("removed", clip.get("groove") is None, str(clip.get("groove")))
+        except CommandError as e:
+            c.check("groove commands", False, str(e))
+    pool1 = client.send("get_groove_pool")
+    left = [g["name"] for g in pool1["grooves"] if g["name"] not in {x["name"] for x in pool0["grooves"]}]
+    if left:
+        c.info("groove pool", f"{left} stays in the Set's pool: Live's API cannot remove pool grooves")
+    return c.finish()
+
+
 SELFTESTS = {
     "selftest-notes": cmd_selftest_notes,
     "selftest-connection": cmd_selftest_connection,
@@ -643,6 +860,9 @@ SELFTESTS = {
     "selftest-returns": cmd_selftest_returns,
     "selftest-automation": cmd_selftest_automation,
     "selftest-meters": cmd_selftest_meters,
+    "selftest-arrangement": cmd_selftest_arrangement,
+    "selftest-noteedit": cmd_selftest_noteedit,
+    "selftest-grooves": cmd_selftest_grooves,
 }
 
 

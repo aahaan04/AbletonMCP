@@ -73,6 +73,13 @@ SCRIPT_CAPABILITIES = [
     # Not a command: delete_clip accepts view="arrangement". Older scripts
     # ignore view and would delete the Session clip in that slot instead.
     "delete_arrangement_clip",
+    "create_return_track",
+    # Not a command: load_browser_item accepts track_type (return/master).
+    # Older scripts ignore it and would load onto the regular track instead.
+    "load_on_return_or_master",
+    "get_clip_automation",
+    "write_clip_automation",
+    "clear_clip_automation",
 ]
 
 def create_instance(c_instance):
@@ -328,7 +335,9 @@ class AbletonMCP(ControlSurface):
                                  # Deletes
                                  "delete_track", "delete_return_track",
                                  "delete_device", "delete_nested_device",
-                                 "create_return_track"]:
+                                 "create_return_track",
+                                 # Clip automation
+                                 "write_clip_automation", "clear_clip_automation"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -394,6 +403,23 @@ class AbletonMCP(ControlSurface):
                                 expected_name=params.get("expected_name"))
                         elif command_type == "create_return_track":
                             result = self._create_return_track()
+                        elif command_type == "write_clip_automation":
+                            result = self._write_clip_automation(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("target"),
+                                params.get("points") or [],
+                                view=params.get("view", "session"),
+                                curve=params.get("curve", "linear"),
+                                resolution=params.get("resolution", 0.0625),
+                                clear_existing=params.get("clear_existing", True))
+                        elif command_type == "clear_clip_automation":
+                            result = self._clear_clip_automation(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                target=params.get("target"),
+                                all_parameters=params.get("all_parameters", False),
+                                view=params.get("view", "session"))
                         elif command_type == "delete_track":
                             result = self._delete_track(
                                 params.get("track_index"), params.get("expected_name"))
@@ -426,7 +452,8 @@ class AbletonMCP(ControlSurface):
                         elif command_type == "load_browser_item":
                             track_index = params.get("track_index", 0)
                             item_uri = params.get("item_uri", "")
-                            result = self._load_browser_item(track_index, item_uri)
+                            result = self._load_browser_item(
+                                track_index, item_uri, params.get("track_type", "track"))
                         # ── Arrangement view commands ──────────────────────────────
                         elif command_type == "switch_to_arrangement_view":
                             result = self._switch_to_arrangement_view()
@@ -560,6 +587,13 @@ class AbletonMCP(ControlSurface):
                     include_notes=include_notes,
                     include_params=include_params,
                 )
+            elif command_type == "get_clip_automation":
+                response["result"] = self._get_clip_automation(
+                    params.get("track_index", 0),
+                    params.get("clip_index", 0),
+                    params.get("target"),
+                    view=params.get("view", "session"),
+                    times=params.get("times"))
             elif command_type == "get_drum_pads":
                 response["result"] = self._get_drum_pads(
                     params.get("track_index", 0), params.get("device_index"))
@@ -769,6 +803,7 @@ class AbletonMCP(ControlSurface):
                 "created": True,
                 "return_track_index": n - 1,
                 "return_track_count": n,
+                "name": self._song.return_tracks[n - 1].name,
             }
         except Exception as e:
             self.log_message("Error creating return track: " + str(e))
@@ -1666,14 +1701,11 @@ class AbletonMCP(ControlSurface):
         """
         return self._load_browser_item(track_index, uri)
 
-    def _load_browser_item(self, track_index, item_uri):
-        """Load a browser item onto a track by its URI"""
+    def _load_browser_item(self, track_index, item_uri, track_type="track"):
+        """Load a browser item onto a track, return track or the master by URI"""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            
-            track = self._song.tracks[track_index]
-            
+            track = self._resolve_track(track_index, track_type)
+
             # Access the application's browser instance instead of creating a new one
             app = self.application()
             
@@ -1693,7 +1725,9 @@ class AbletonMCP(ControlSurface):
                 "loaded": True,
                 "item_name": item.name,
                 "track_name": track.name,
-                "uri": item_uri
+                "track_type": (track_type or "track").lower(),
+                "uri": item_uri,
+                "devices_after": [d.name for d in track.devices],
             }
             return result
         except Exception as e:
@@ -2082,6 +2116,25 @@ class AbletonMCP(ControlSurface):
         # steps ends on a device step, so chain is that device's parent.
         return device, " > ".join(location), chain, steps[-1]
 
+    def _pick_parameter(self, device, parameter_index=None, parameter_name=None):
+        """Exactly one of index or name (case-insensitive, whitespace-trimmed
+        exact match). Returns (index, parameter)."""
+        params = list(device.parameters)
+        if (parameter_index is None) == (parameter_name is None):
+            raise ValueError("Give exactly one of parameter_index or parameter_name")
+        if parameter_name is not None:
+            wanted = parameter_name.strip().lower()
+            matches = [i for i, p in enumerate(params) if p.name.strip().lower() == wanted]
+            if len(matches) != 1:
+                raise ValueError("%d parameters named '%s' on '%s' (have: %s)"
+                                 % (len(matches), parameter_name, device.name,
+                                    ", ".join(p.name.strip() for p in params)))
+            parameter_index = matches[0]
+        if parameter_index < 0 or parameter_index >= len(params):
+            raise IndexError("parameter_index %s out of range ('%s' has %d parameters)"
+                             % (parameter_index, device.name, len(params)))
+        return parameter_index, params[parameter_index]
+
     def _get_nested_device_parameters(self, track_index, device_index, chain_index=None,
                                       pad_note=None, nested_device_index=0, path=None):
         try:
@@ -2101,21 +2154,7 @@ class AbletonMCP(ControlSurface):
         try:
             device, location, _, _ = self._resolve_nested_device(
                 track_index, device_index, chain_index, pad_note, nested_device_index, path)
-            params = list(device.parameters)
-            if (parameter_index is None) == (parameter_name is None):
-                raise ValueError("Give exactly one of parameter_index or parameter_name")
-            if parameter_name is not None:
-                wanted = parameter_name.strip().lower()
-                matches = [i for i, p in enumerate(params) if p.name.strip().lower() == wanted]
-                if len(matches) != 1:
-                    raise ValueError("%d parameters named '%s' on '%s' (have: %s)"
-                                     % (len(matches), parameter_name, device.name,
-                                        ", ".join(p.name.strip() for p in params)))
-                parameter_index = matches[0]
-            if parameter_index < 0 or parameter_index >= len(params):
-                raise IndexError("parameter_index %s out of range ('%s' has %d parameters)"
-                                 % (parameter_index, device.name, len(params)))
-            param = params[parameter_index]
+            parameter_index, param = self._pick_parameter(device, parameter_index, parameter_name)
             value = float(value)
             if value < param.min or value > param.max:
                 raise ValueError("%s takes %s..%s, got %s" % (param.name.strip(), param.min, param.max, value))
@@ -2135,6 +2174,200 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error setting nested device parameter: " + str(e))
+            raise
+
+    # ── Clip automation envelopes ───────────────────────────────────────────────
+    # Envelope times are beats from the clip's start; values are in the
+    # parameter's own units (param.min..param.max). Live's only envelope writer
+    # is insert_step(time, length, value), which draws a flat segment, so ramps
+    # are drawn as short steps of `resolution` beats.
+
+    def _automation_clip(self, track_index, clip_index, view="session"):
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if view == "arrangement":
+            clips = list(track.arrangement_clips)
+            if clip_index < 0 or clip_index >= len(clips):
+                raise IndexError("Arrangement clip index %s out of range (track '%s' has %d)"
+                                 % (clip_index, track.name, len(clips)))
+            return track, clips[clip_index]
+        if view != "session":
+            raise ValueError("view must be 'session' or 'arrangement', got '%s'" % view)
+        if clip_index < 0 or clip_index >= len(track.clip_slots):
+            raise IndexError("Clip index out of range")
+        slot = track.clip_slots[clip_index]
+        if not slot.has_clip:
+            raise ValueError("No clip in slot %d of track '%s'" % (clip_index, track.name))
+        return track, slot.clip
+
+    def _automation_parameter(self, track_index, track, target):
+        """Resolve target to (parameter, location). target is either
+        {"mixer": "volume"|"panning"|"send", "send_index": n} or
+        {"device_index": n, "parameter_name"|"parameter_index": ...} with an
+        optional nested address (chain_index or pad_note, nested_device_index,
+        path) for a device inside a rack."""
+        if not isinstance(target, dict):
+            raise ValueError("target must be an object naming a mixer or device parameter")
+        mixer = target.get("mixer")
+        if mixer is not None:
+            if target.get("device_index") is not None:
+                raise ValueError("target names both a mixer control and a device; give one")
+            md = track.mixer_device
+            mixer = str(mixer).lower()
+            if mixer == "volume":
+                return md.volume, "Mixer > Volume"
+            if mixer in ("pan", "panning"):
+                return md.panning, "Mixer > Pan"
+            if mixer == "send":
+                sends = list(md.sends)
+                si = target.get("send_index")
+                if si is None or si < 0 or si >= len(sends):
+                    raise IndexError("send_index %s out of range (track has %d sends)" % (si, len(sends)))
+                return sends[si], "Mixer > Send %s" % sends[si].name
+            raise ValueError("Unknown mixer target '%s' (volume, panning or send)" % mixer)
+
+        device_index = target.get("device_index")
+        if device_index is None:
+            raise ValueError("target needs either mixer or device_index")
+        if target.get("chain_index") is not None or target.get("pad_note") is not None:
+            device, location, _, _ = self._resolve_nested_device(
+                track_index, device_index, target.get("chain_index"), target.get("pad_note"),
+                target.get("nested_device_index", 0), target.get("path"))
+        else:
+            _, device = self._track_device(track_index, device_index)
+            location = device.name
+        _, param = self._pick_parameter(device, target.get("parameter_index"),
+                                        target.get("parameter_name"))
+        return param, "%s > %s" % (location, param.name.strip())
+
+    def _automation_point_value(self, param, point):
+        has_value, has_norm = "value" in point, "normalized" in point
+        if has_value == has_norm:
+            raise ValueError("Each point needs exactly one of value or normalized")
+        if has_value:
+            v = float(point["value"])
+        else:
+            n = float(point["normalized"])
+            if n < 0.0 or n > 1.0:
+                raise ValueError("normalized must be 0..1, got %s" % n)
+            v = float(param.min) + n * (float(param.max) - float(param.min))
+        if v < float(param.min) - 1e-9 or v > float(param.max) + 1e-9:
+            raise ValueError("%s takes %s..%s, got %s" % (param.name.strip(), param.min, param.max, v))
+        return v
+
+    def _write_clip_automation(self, track_index, clip_index, target, points, view="session",
+                               curve="linear", resolution=0.0625, clear_existing=True):
+        try:
+            track, clip = self._automation_clip(track_index, clip_index, view)
+            param, location = self._automation_parameter(track_index, track, target)
+            if not points:
+                raise ValueError("At least one point is required")
+            if curve not in ("linear", "step"):
+                raise ValueError("curve must be 'linear' or 'step'")
+            resolution = max(1.0 / 128.0, float(resolution))
+            length = float(clip.length)
+            resolved = sorted(
+                (float(p.get("time", 0.0)), self._automation_point_value(param, p)) for p in points)
+            for t, _ in resolved:
+                if t < 0.0 or t > length + 1e-9:
+                    raise ValueError("Point time %s is outside the clip (0..%s beats)" % (t, length))
+            for (t0, _), (t1, _) in zip(resolved, resolved[1:]):
+                if t1 - t0 < 1e-9:
+                    raise ValueError("Two points at time %s" % t0)
+
+            envelope = clip.automation_envelope(param)
+            if envelope is not None and clear_existing:
+                clip.clear_envelope(param)
+                envelope = None
+            if envelope is None:
+                try:
+                    envelope = clip.create_automation_envelope(param)
+                except Exception as e:
+                    raise Exception("Live refused to create an envelope for %s on this %s clip: %s"
+                                    % (location, view, e))
+            if envelope is None:
+                raise Exception("Live refused to create an envelope for %s on this %s clip"
+                                % (location, view))
+
+            quantized = bool(getattr(param, "is_quantized", False))
+            steps = []
+            if resolved[0][0] > 0.0:
+                steps.append((0.0, resolved[0][0], resolved[0][1]))
+            for (t0, v0), (t1, v1) in zip(resolved, resolved[1:]):
+                if curve == "step" or quantized or v0 == v1:
+                    steps.append((t0, t1 - t0, v0))
+                    continue
+                t = t0
+                while t < t1 - 1e-9:
+                    seg = min(resolution, t1 - t)
+                    steps.append((t, seg, v0 + (v1 - v0) * (t - t0) / (t1 - t0)))
+                    t += seg
+            last_t, last_v = resolved[-1]
+            steps.append((last_t, max(length - last_t, resolution), last_v))
+            if len(steps) > 4096:
+                raise ValueError("Envelope would need %d steps; raise resolution" % len(steps))
+            for t, seg, v in steps:
+                envelope.insert_step(t, seg, float(round(v)) if quantized else v)
+
+            # A parameter moved by hand ignores its envelope until re-enabled.
+            if hasattr(param, "re_enable_automation"):
+                try:
+                    param.re_enable_automation()
+                except Exception:
+                    pass
+            return {
+                "location": location,
+                "clip_name": clip.name,
+                "view": view,
+                "points": len(resolved),
+                "steps": len(steps),
+                "start": resolved[0][0],
+                "end": last_t,
+                "first_display": param.str_for_value(resolved[0][1]),
+                "last_display": param.str_for_value(last_v),
+            }
+        except Exception as e:
+            self.log_message("Error writing clip automation: " + str(e))
+            raise
+
+    def _get_clip_automation(self, track_index, clip_index, target, view="session", times=None):
+        try:
+            track, clip = self._automation_clip(track_index, clip_index, view)
+            param, location = self._automation_parameter(track_index, track, target)
+            length = float(clip.length)
+            envelope = clip.automation_envelope(param)
+            result = {"location": location, "clip_name": clip.name, "view": view,
+                      "length": length, "min": float(param.min), "max": float(param.max),
+                      "has_envelope": envelope is not None}
+            if envelope is None:
+                return result
+            if times is None:
+                times = [length * i / 8.0 for i in range(8)] + [max(0.0, length - 1e-3)]
+            samples = []
+            for t in times:
+                v = float(envelope.value_at_time(float(t)))
+                samples.append({"time": float(t), "value": v, "display": param.str_for_value(v)})
+            result["samples"] = samples
+            return result
+        except Exception as e:
+            self.log_message("Error reading clip automation: " + str(e))
+            raise
+
+    def _clear_clip_automation(self, track_index, clip_index, target=None, all_parameters=False,
+                               view="session"):
+        try:
+            track, clip = self._automation_clip(track_index, clip_index, view)
+            if (target is None) == (not all_parameters):
+                raise ValueError("Give either target or all_parameters=true")
+            if all_parameters:
+                clip.clear_all_envelopes()
+                return {"cleared": "all", "clip_name": clip.name, "view": view}
+            param, location = self._automation_parameter(track_index, track, target)
+            clip.clear_envelope(param)
+            return {"cleared": location, "clip_name": clip.name, "view": view}
+        except Exception as e:
+            self.log_message("Error clearing clip automation: " + str(e))
             raise
 
     # ── Passive human-UI listeners ──────────────────────────────────────────────

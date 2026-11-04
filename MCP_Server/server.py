@@ -125,6 +125,8 @@ class AbletonConnection:
             "set_nested_device_parameter",
             # Deletes (delete_clip is listed above)
             "delete_track", "delete_return_track", "delete_device", "delete_nested_device",
+            "create_return_track", "load_browser_item",
+            "write_clip_automation", "clear_clip_automation",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -877,20 +879,39 @@ def set_tempo(ctx: Context, tempo: float, user_prompt: str = "") -> str:
 @mcp.tool()
 @rich_telemetry_tool("load_instrument_or_effect")
 @trajectory_tool("load_instrument_or_effect")
-def load_instrument_or_effect(ctx: Context, track_index: int, uri: str, user_prompt: str = "") -> str:
+def load_instrument_or_effect(
+    ctx: Context,
+    track_index: int,
+    uri: str,
+    track_type: str = "track",
+    user_prompt: str = ""
+) -> str:
     """
-    Load an instrument or effect onto a track using its URI.
+    Load an instrument or effect onto a track, a return track or the master
+    using its browser URI. Effects go at the end of the device chain.
+
+    For a reverb/delay bus: create_return_track, load the effect on it with
+    track_type="return", then set_send on the source tracks.
 
     Parameters:
-    - track_index: The index of the track to load the instrument on
+    - track_index: The index of the track (or return track; ignored for master)
     - uri: The URI of the instrument or effect to load (e.g., 'query:Synths#Instrument%20Rack:Bass:FileId_5116')
+    - track_type: "track" (default), "return", or "master". Returns and the
+      master take effects only.
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         ableton = get_ableton_connection()
+        if track_type != "track":
+            from .script_handshake import require_capability
+
+            missing = require_capability("load_on_return_or_master", ableton.send_command)
+            if missing:
+                return missing
         result = ableton.send_command("load_browser_item", {
             "track_index": track_index,
-            "item_uri": uri
+            "item_uri": uri,
+            "track_type": track_type,
         })
         
         # Check if the instrument was loaded successfully
@@ -1958,19 +1979,208 @@ def set_nested_device_parameter(
         return f"Error setting nested device parameter: {str(e)}"
 
 @mcp.tool()
-def create_return_track(ctx: Context) -> str:
+@telemetry_tool("create_return_track")
+@trajectory_tool("create_return_track")
+def create_return_track(ctx: Context, user_prompt: str = "") -> str:
     """
     Create a return track at the end of the session.
 
-    Returns the index of the newly created return track.
+    Returns the index of the newly created return track. Every track gains a
+    send to it at that same index (set it with set_send). Load effects onto it
+    with load_instrument_or_effect(track_type="return").
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        from .script_handshake import require_capability
+
         ableton = get_ableton_connection()
+        missing = require_capability("create_return_track", ableton.send_command)
+        if missing:
+            return missing
         result = ableton.send_command("create_return_track", {})
-        return f"Created return track at index {result.get('return_track_index')} (total returns: {result.get('return_track_count')})"
+        return f"Created return track '{result.get('name')}' at index {result.get('return_track_index')} (total returns: {result.get('return_track_count')})"
     except Exception as e:
         logger.error(f"Error creating return track: {str(e)}")
         return f"Error creating return track: {str(e)}"
+
+# ── Clip automation tools ─────────────────────────────────────────────────────
+
+def _automation_call(command: str, params: Dict[str, Any]) -> Dict[str, Any] | str:
+    from .script_handshake import require_capability
+
+    ableton = get_ableton_connection()
+    missing = require_capability(command, ableton.send_command)
+    if missing:
+        return missing
+    return ableton.send_command(command, params)
+
+
+@mcp.tool()
+@telemetry_tool("get_clip_automation")
+@trajectory_tool("get_clip_automation")
+def get_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    target: Dict[str, Any],
+    times: Optional[List[float]] = None,
+    view: str = "session",
+    user_prompt: str = ""
+) -> str:
+    """
+    Read a clip's automation envelope for one parameter, sampled at given
+    times (beats from the clip start; default: 9 points spread over the clip).
+    Returns has_envelope=false when the parameter is not automated in this clip.
+    
+    target picks the parameter, on the same track as the clip. Either:
+    - a mixer control: {"mixer": "volume"} | {"mixer": "panning"} |
+      {"mixer": "send", "send_index": 0}
+    - a device parameter: {"device_index": 1, "parameter_name": "Frequency"}
+      (or "parameter_index"). For a device inside a rack add the nested
+      address used by get_nested_device_parameters: "chain_index" or
+      "pad_note", plus "nested_device_index" and optional "path".
+    Read get_device_parameters / get_nested_device_parameters first for the
+    parameter's exact name and its min..max range.
+
+    Parameters:
+    - track_index: Track holding the clip
+    - clip_index: Session slot index (view="session")
+    - target: Parameter to read, see above
+    - times: Optional list of beat positions to sample
+    - view: "session" (default) or "arrangement"
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _automation_call("get_clip_automation", {
+            "track_index": track_index, "clip_index": clip_index,
+            "target": target, "times": times, "view": view})
+        return result if isinstance(result, str) else json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error reading clip automation: {str(e)}")
+        return f"Error reading clip automation: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("write_clip_automation")
+@trajectory_tool("write_clip_automation")
+def write_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    target: Dict[str, Any],
+    points: List[Dict[str, float]],
+    curve: str = "linear",
+    resolution: float = 0.0625,
+    clear_existing: bool = True,
+    view: str = "session",
+    user_prompt: str = ""
+) -> str:
+    """
+    Draw an automation envelope on a Session clip from breakpoints, e.g. a
+    filter sweep or a volume fade. The envelope plays whenever the clip plays,
+    including after duplicate_to_arrangement.
+
+    Time: each point's "time" is in BEATS from the clip's start (4 beats = 1
+    bar in 4/4; an 8-bar sweep runs 0 to 32). Times must lie within the
+    clip's length.
+
+    Value: give each point exactly one of
+    - "value": the parameter's own units, within its min..max (as shown by
+      get_device_parameters; mixer volume is 0..1 with 0.85 = 0 dB), or
+    - "normalized": 0..1 across the parameter's range (0 = min, 1 = max).
+    Out-of-range values are refused, not clamped.
+
+    Before the first point the first value holds; after the last point the
+    last value holds to the clip end.
+    
+    target picks the parameter, on the same track as the clip. Either:
+    - a mixer control: {"mixer": "volume"} | {"mixer": "panning"} |
+      {"mixer": "send", "send_index": 0}
+    - a device parameter: {"device_index": 1, "parameter_name": "Frequency"}
+      (or "parameter_index"). For a device inside a rack add the nested
+      address used by get_nested_device_parameters: "chain_index" or
+      "pad_note", plus "nested_device_index" and optional "path".
+    Read get_device_parameters / get_nested_device_parameters first for the
+    parameter's exact name and its min..max range.
+
+    Example, 8-bar rising cutoff on Auto Filter at device 0:
+      target={"device_index": 0, "parameter_name": "Frequency"},
+      points=[{"time": 0, "normalized": 0.1}, {"time": 32, "normalized": 0.9}]
+
+    Parameters:
+    - track_index: Track holding the clip
+    - clip_index: Session slot index
+    - target: Parameter to automate, see above
+    - points: [{"time": beats, "value": v} or {"time": beats, "normalized": 0..1}, ...]
+    - curve: "linear" (ramps between points, default) or "step" (hold each value until the next point)
+    - resolution: Ramp step length in beats (default 1/16 beat); larger = fewer steps
+    - clear_existing: Replace any existing envelope for this parameter (default true)
+    - view: "session" (default). "arrangement" is attempted but Live may refuse it.
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _automation_call("write_clip_automation", {
+            "track_index": track_index, "clip_index": clip_index, "target": target,
+            "points": points, "curve": curve, "resolution": resolution,
+            "clear_existing": clear_existing, "view": view})
+        if isinstance(result, str):
+            return result
+        return (
+            f"Automated {result.get('location')} on clip '{result.get('clip_name')}': "
+            f"{result.get('points')} points over beats {result.get('start')}–{result.get('end')}, "
+            f"{result.get('first_display')} → {result.get('last_display')} ({result.get('steps')} steps)"
+        )
+    except Exception as e:
+        logger.error(f"Error writing clip automation: {str(e)}")
+        return f"Error writing clip automation: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("clear_clip_automation")
+@trajectory_tool("clear_clip_automation")
+def clear_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    target: Optional[Dict[str, Any]] = None,
+    all_parameters: bool = False,
+    view: str = "session",
+    user_prompt: str = ""
+) -> str:
+    """
+    Remove automation from one clip: one parameter's envelope (target), or
+    every envelope in the clip (all_parameters=true). Give exactly one.
+    
+    target picks the parameter, on the same track as the clip. Either:
+    - a mixer control: {"mixer": "volume"} | {"mixer": "panning"} |
+      {"mixer": "send", "send_index": 0}
+    - a device parameter: {"device_index": 1, "parameter_name": "Frequency"}
+      (or "parameter_index"). For a device inside a rack add the nested
+      address used by get_nested_device_parameters: "chain_index" or
+      "pad_note", plus "nested_device_index" and optional "path".
+    Read get_device_parameters / get_nested_device_parameters first for the
+    parameter's exact name and its min..max range.
+
+    Parameters:
+    - track_index: Track holding the clip
+    - clip_index: Session slot index
+    - target: Parameter whose envelope to remove, see above
+    - all_parameters: true to remove every envelope in this clip
+    - view: "session" (default) or "arrangement"
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _automation_call("clear_clip_automation", {
+            "track_index": track_index, "clip_index": clip_index, "target": target,
+            "all_parameters": all_parameters, "view": view})
+        if isinstance(result, str):
+            return result
+        return f"Cleared automation ({result.get('cleared')}) on clip '{result.get('clip_name')}'"
+    except Exception as e:
+        logger.error(f"Error clearing clip automation: {str(e)}")
+        return f"Error clearing clip automation: {str(e)}"
 
 # ── Delete tools ──────────────────────────────────────────────────────────────
 # One target per call, by explicit index. Indexes after the deleted item shift

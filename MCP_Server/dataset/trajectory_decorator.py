@@ -44,6 +44,9 @@ MODIFYING_TOOLS = {
     "set_track_mute",
     "set_track_solo",
     "set_nested_device_parameter",
+    "create_return_track",
+    "write_clip_automation",
+    "clear_clip_automation",
 }
 
 _PARAM_KEYS = (

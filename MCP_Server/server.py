@@ -123,6 +123,8 @@ class AbletonConnection:
             "set_track_mute", "set_track_solo",
             # Rack commands
             "set_nested_device_parameter",
+            # Deletes (delete_clip is listed above)
+            "delete_track", "delete_return_track", "delete_device", "delete_nested_device",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -954,28 +956,42 @@ def stop_clip(ctx: Context, track_index: int, clip_index: int, user_prompt: str 
 
 @mcp.tool()
 @telemetry_tool("delete_clip")
-def delete_clip(ctx: Context, track_index: int, clip_index: int, user_prompt: str = "") -> str:
+def delete_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    view: str = "session",
+    expected_name: Optional[str] = None,
+    user_prompt: str = ""
+) -> str:
     """
-    Delete the clip in the given clip slot, freeing it for reuse.
+    Delete one clip: a Session clip (freeing its slot) or an Arrangement clip.
 
     Use this before create_clip when you want to overwrite an existing clip
     (create_clip itself refuses to write into an occupied slot).
 
     Parameters:
     - track_index: The index of the track containing the clip
-    - clip_index: The index of the clip slot to clear
+    - clip_index: view="session": the clip slot index. view="arrangement": the
+      clip's position in get_arrangement_clips for that track.
+    - view: "session" (default) or "arrangement"
+    - expected_name: Optional; refuse unless the clip has exactly this name
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         from .script_handshake import require_capability
 
         ableton = get_ableton_connection()
-        missing = require_capability("delete_clip", ableton.send_command)
+        missing = require_capability(
+            "delete_arrangement_clip" if view == "arrangement" else "delete_clip",
+            ableton.send_command)
         if missing:
             return missing
         result = ableton.send_command("delete_clip", {
             "track_index": track_index,
             "clip_index": clip_index,
+            "view": view,
+            "expected_name": expected_name,
         })
         return json.dumps(result, indent=2)
     except Exception as e:
@@ -1940,6 +1956,143 @@ def set_nested_device_parameter(
     except Exception as e:
         logger.error(f"Error setting nested device parameter: {str(e)}")
         return f"Error setting nested device parameter: {str(e)}"
+
+# ── Delete tools ──────────────────────────────────────────────────────────────
+# One target per call, by explicit index. Indexes after the deleted item shift
+# down, so re-read (get_session_info / get_track_info) before the next delete,
+# or pass expected_name so a shifted index is refused instead of deleting the
+# wrong thing.
+
+def _run_delete(command: str, params: Dict[str, Any], what: str) -> str:
+    from .script_handshake import require_capability
+
+    ableton = get_ableton_connection()
+    missing = require_capability(command, ableton.send_command)
+    if missing:
+        return missing
+    result = ableton.send_command(command, params)
+    where = f" from {result['location']}" if result.get("location") else (
+        f" from '{result['track_name']}'" if result.get("track_name") else "")
+    return f"Deleted {what} '{result.get('name')}'{where}"
+
+@mcp.tool()
+@telemetry_tool("delete_track")
+def delete_track(
+    ctx: Context,
+    track_index: int,
+    expected_name: Optional[str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Delete one track (regular MIDI/audio/group track) and everything on it.
+    Live cannot delete its last remaining track.
+
+    Parameters:
+    - track_index: The index of the track to delete
+    - expected_name: Optional; refuse unless the track has exactly this name
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        return _run_delete("delete_track", {"track_index": track_index,
+                                            "expected_name": expected_name}, "track")
+    except Exception as e:
+        logger.error(f"Error deleting track: {str(e)}")
+        return f"Error deleting track: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("delete_return_track")
+def delete_return_track(
+    ctx: Context,
+    return_index: int,
+    expected_name: Optional[str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Delete one return track. Every track's send to it is removed too.
+
+    Parameters:
+    - return_index: The return track's index (0 = A)
+    - expected_name: Optional; refuse unless the return track has exactly this name
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        return _run_delete("delete_return_track", {"return_index": return_index,
+                                                   "expected_name": expected_name}, "return track")
+    except Exception as e:
+        logger.error(f"Error deleting return track: {str(e)}")
+        return f"Error deleting return track: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("delete_device")
+def delete_device(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    track_type: str = "track",
+    expected_name: Optional[str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Delete one top-level device from a track's device chain. To delete a
+    device inside a rack, use delete_nested_device.
+
+    Parameters:
+    - track_index: The track's index (ignored when track_type is "master")
+    - device_index: The device's index in the track's devices
+    - track_type: "track" (default), "return", or "master"
+    - expected_name: Optional; refuse unless the device has exactly this name
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        return _run_delete("delete_device", {"track_index": track_index,
+                                             "device_index": device_index,
+                                             "track_type": track_type,
+                                             "expected_name": expected_name}, "device")
+    except Exception as e:
+        logger.error(f"Error deleting device: {str(e)}")
+        return f"Error deleting device: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("delete_nested_device")
+def delete_nested_device(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_index: Optional[int] = None,
+    pad_note: Optional[int] = None,
+    nested_device_index: int = 0,
+    path: Optional[List[int]] = None,
+    expected_name: Optional[str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Delete one device inside a rack chain. Addressing is the same as
+    get_nested_device_parameters: exactly one of chain_index or pad_note,
+    then nested_device_index, plus optional deeper path pairs.
+
+    Parameters:
+    - track_index: The track holding the rack
+    - device_index: The rack's index in the track's devices
+    - chain_index: Chain in the rack (give this or pad_note)
+    - pad_note: Drum Rack pad note, 0-127 (give this or chain_index)
+    - nested_device_index: Device index within that chain (default 0)
+    - path: Optional deeper [chain_index, device_index, ...] pairs
+    - expected_name: Optional; refuse unless the device has exactly this name
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        return _run_delete("delete_nested_device", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "chain_index": chain_index,
+            "pad_note": pad_note,
+            "nested_device_index": nested_device_index,
+            "path": path,
+            "expected_name": expected_name,
+        }, "device")
+    except Exception as e:
+        logger.error(f"Error deleting nested device: {str(e)}")
+        return f"Error deleting nested device: {str(e)}"
 
 # Main execution
 def main():

@@ -39,6 +39,9 @@ class Chain:
         if in_note is not None:
             self.in_note = in_note
 
+    def delete_device(self, index):
+        del self.devices[index]
+
 
 class Pad:
     def __init__(self, note, name="", chains=()):

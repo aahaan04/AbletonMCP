@@ -394,8 +394,8 @@ def _roundtrip_param(c, ops, label, address, preferred):
         ops.run("set_nested_device_parameter", value=new, parameter_name=name, **address)
         back = next(q for q in ops.run("get_nested_device_parameters", **address)["device"]["parameters"]
                     if q["name"].strip() == name)
-        c.check(label, _close(back["value"], new, 1e-4),
-                f"{name}: {old:g} -> {back['value']:g} ({back.get('value_string', '')})")
+        shown = f" ({back['value_string']})" if back.get("value_string") else ""
+        c.check(label, _close(back["value"], new, 1e-4), f"{name}: {old:g} -> {back['value']:g}{shown}")
     finally:
         ops.run("set_nested_device_parameter", value=old, parameter_name=name, **address)
     restored = next(q for q in ops.run("get_nested_device_parameters", **address)["device"]["parameters"]
@@ -444,11 +444,82 @@ def cmd_selftest_drums(client: Client, via_server: bool) -> int:
     return c.finish()
 
 
+# --------------------------------------------------------------------------
+# selftest-deletes: throwaway track with kit + clips, delete inside-out
+# --------------------------------------------------------------------------
+
+DELETE_TRACK = "ableton_cli delete me"
+
+
+def _refused(ops, command, **params):
+    try:
+        ops.run(command, **params)
+        return False
+    except CommandError as e:
+        return "Refusing to delete" in str(e)
+
+
+def cmd_selftest_deletes(client: Client, via_server: bool) -> int:
+    ops = ServerOps() if via_server else RawOps(client)
+    track = client.send("create_midi_track", {"index": -1})["index"]
+    client.send("set_track_name", {"track_index": track, "name": DELETE_TRACK})
+    items = client.send("get_browser_items_at_path", {"path": "drums"})["items"]
+    kit = next((i for i in items if i["name"] == DRUM_KIT), None) \
+        or next(i for i in items if i["name"].endswith(".adg"))
+    client.send("load_browser_item", {"track_index": track, "item_uri": kit["uri"]})
+    client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+    client.send("duplicate_session_clip_to_arrangement",
+                {"track_index": track, "clip_index": 0, "destination_time": 0.0})
+    print(f"selftest-deletes via {ops.label}: track {track} ({DELETE_TRACK!r}) "
+          f"with {kit['name']}, a session clip and an arrangement clip")
+
+    c = Checker()
+    try:
+        n = client.send("get_arrangement_clips", {"track_index": track})["clip_count"]
+        ops.run("delete_clip", track_index=track, clip_index=0, view="arrangement")
+        left = client.send("get_arrangement_clips", {"track_index": track})["clip_count"]
+        c.check("arrangement clip", n == 1 and left == 0, f"{n} -> {left}")
+
+        ops.run("delete_clip", track_index=track, clip_index=0)
+        slot = client.send("get_track_info", {"track_index": track})["clip_slots"][0]
+        c.check("session clip", not slot["has_clip"], "slot 0 empty")
+
+        pad_rack = {"track_index": track, "device_index": 0, "pad_note": 36, "nested_device_index": 0}
+        inner = lambda: client.send("get_nested_device_parameters", pad_rack)["device"]["chains"][0]["devices"]
+        before = [d["name"] for d in inner()]
+        ops.run("delete_nested_device", **dict(pad_rack, path=[0, 0]))
+        after = [d["name"] for d in inner()]
+        c.check("nested device", len(after) == len(before) - 1, f"{before} -> {after}")
+
+        c.check("wrong name refused", _refused(ops, "delete_device", track_index=track,
+                                               device_index=0, expected_name="Not The Kit"))
+        ops.run("delete_device", track_index=track, device_index=0, expected_name=kit["name"][:-4])
+        devices = client.send("get_track_info", {"track_index": track})["devices"]
+        c.check("device", devices == [], f"{len(devices)} devices left")
+
+        returns = client.send("get_session_info")["return_track_count"]
+        refused = _refused(ops, "delete_return_track", return_index=0, expected_name="__not_a_return__")
+        c.check("return wrong name", refused
+                and client.send("get_session_info")["return_track_count"] == returns,
+                f"{returns} returns kept")
+    except CommandError as e:
+        c.check("delete commands", False, str(e))
+    finally:
+        count = client.send("get_session_info")["track_count"]
+        ops.run("delete_track", track_index=track, expected_name=DELETE_TRACK)
+        names = [client.send("get_track_info", {"track_index": i})["name"]
+                 for i in range(client.send("get_session_info")["track_count"])]
+        c.check("track", len(names) == count - 1 and DELETE_TRACK not in names,
+                f"{count} -> {len(names)} tracks")
+    return c.finish()
+
+
 SELFTESTS = {
     "selftest-notes": cmd_selftest_notes,
     "selftest-connection": cmd_selftest_connection,
     "selftest-mixer": cmd_selftest_mixer,
     "selftest-drums": cmd_selftest_drums,
+    "selftest-deletes": cmd_selftest_deletes,
 }
 
 

@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.8.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -66,6 +66,13 @@ SCRIPT_CAPABILITIES = [
     "get_drum_pads",
     "get_nested_device_parameters",
     "set_nested_device_parameter",
+    "delete_track",
+    "delete_return_track",
+    "delete_device",
+    "delete_nested_device",
+    # Not a command: delete_clip accepts view="arrangement". Older scripts
+    # ignore view and would delete the Session clip in that slot instead.
+    "delete_arrangement_clip",
 ]
 
 def create_instance(c_instance):
@@ -317,7 +324,10 @@ class AbletonMCP(ControlSurface):
                                  "set_track_volume", "set_track_panning", "set_send",
                                  "set_track_mute", "set_track_solo",
                                  # Racks
-                                 "set_nested_device_parameter"]:
+                                 "set_nested_device_parameter",
+                                 # Deletes
+                                 "delete_track", "delete_return_track",
+                                 "delete_device", "delete_nested_device"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -376,9 +386,32 @@ class AbletonMCP(ControlSurface):
                             clip_index = params.get("clip_index", 0)
                             result = self._stop_clip(track_index, clip_index)
                         elif command_type == "delete_clip":
-                            track_index = params.get("track_index", 0)
-                            clip_index = params.get("clip_index", 0)
-                            result = self._delete_clip(track_index, clip_index)
+                            result = self._delete_clip(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                view=params.get("view", "session"),
+                                expected_name=params.get("expected_name"))
+                        elif command_type == "delete_track":
+                            result = self._delete_track(
+                                params.get("track_index"), params.get("expected_name"))
+                        elif command_type == "delete_return_track":
+                            result = self._delete_return_track(
+                                params.get("return_index"), params.get("expected_name"))
+                        elif command_type == "delete_device":
+                            result = self._delete_device(
+                                params.get("track_index"),
+                                params.get("device_index"),
+                                params.get("track_type", "track"),
+                                params.get("expected_name"))
+                        elif command_type == "delete_nested_device":
+                            result = self._delete_nested_device(
+                                params.get("track_index"),
+                                params.get("device_index"),
+                                chain_index=params.get("chain_index"),
+                                pad_note=params.get("pad_note"),
+                                nested_device_index=params.get("nested_device_index", 0),
+                                path=params.get("path"),
+                                expected_name=params.get("expected_name"))
                         elif command_type == "start_playback":
                             result = self._start_playback()
                         elif command_type == "stop_playback":
@@ -1169,13 +1202,39 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error stopping clip: " + str(e))
             raise
 
-    def _delete_clip(self, track_index, clip_index):
-        """Delete the clip in the given clip slot, freeing the slot for reuse."""
+    # ── Deletes ─────────────────────────────────────────────────────────────────
+    # Each takes explicit indexes, deletes exactly one thing, and reports its
+    # name. expected_name, when given, must match the target, which guards
+    # against indexes that shifted after an earlier delete.
+
+    def _check_expected_name(self, kind, actual, expected_name):
+        if expected_name is not None and actual != expected_name:
+            raise ValueError("Refusing to delete: %s is named '%s', not '%s'"
+                             % (kind, actual, expected_name))
+
+    def _delete_clip(self, track_index, clip_index, view="session", expected_name=None):
+        """Delete one Session clip (clip_index = slot) or Arrangement clip
+        (clip_index = position in track.arrangement_clips, as listed by
+        get_arrangement_clips)."""
         try:
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
 
             track = self._song.tracks[track_index]
+
+            if view == "arrangement":
+                clips = list(track.arrangement_clips)
+                if clip_index < 0 or clip_index >= len(clips):
+                    raise IndexError("Arrangement clip index %s out of range (track '%s' has %d)"
+                                     % (clip_index, track.name, len(clips)))
+                clip = clips[clip_index]
+                self._check_expected_name("arrangement clip %d" % clip_index, clip.name, expected_name)
+                name, start = clip.name, float(clip.start_time)
+                track.delete_clip(clip)
+                return {"deleted": True, "view": view, "name": name,
+                        "track_name": track.name, "start_time": start}
+            if view != "session":
+                raise ValueError("view must be 'session' or 'arrangement', got '%s'" % view)
 
             if clip_index < 0 or clip_index >= len(track.clip_slots):
                 raise IndexError("Clip index out of range")
@@ -1183,13 +1242,71 @@ class AbletonMCP(ControlSurface):
             clip_slot = track.clip_slots[clip_index]
 
             if not clip_slot.has_clip:
-                return {"deleted": False, "reason": "Clip slot was already empty"}
+                return {"deleted": False, "view": view, "reason": "Clip slot was already empty"}
 
+            name = clip_slot.clip.name
+            self._check_expected_name("clip in slot %d" % clip_index, name, expected_name)
             clip_slot.delete_clip()
 
-            return {"deleted": True}
+            return {"deleted": True, "view": view, "name": name, "track_name": track.name}
         except Exception as e:
             self.log_message("Error deleting clip: " + str(e))
+            raise
+
+    def _delete_track(self, track_index, expected_name=None):
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index %s out of range (have %d tracks)"
+                                 % (track_index, len(self._song.tracks)))
+            name = self._song.tracks[track_index].name
+            self._check_expected_name("track %d" % track_index, name, expected_name)
+            self._song.delete_track(track_index)
+            return {"deleted": True, "name": name, "track_count": len(self._song.tracks)}
+        except Exception as e:
+            self.log_message("Error deleting track: " + str(e))
+            raise
+
+    def _delete_return_track(self, return_index, expected_name=None):
+        try:
+            returns = self._song.return_tracks
+            if return_index < 0 or return_index >= len(returns):
+                raise IndexError("Return track index %s out of range (have %d)"
+                                 % (return_index, len(returns)))
+            name = returns[return_index].name
+            self._check_expected_name("return track %d" % return_index, name, expected_name)
+            self._song.delete_return_track(return_index)
+            return {"deleted": True, "name": name,
+                    "return_track_count": len(self._song.return_tracks)}
+        except Exception as e:
+            self.log_message("Error deleting return track: " + str(e))
+            raise
+
+    def _delete_device(self, track_index, device_index, track_type="track", expected_name=None):
+        try:
+            track = self._resolve_track(track_index, track_type)
+            devices = list(track.devices)
+            if device_index < 0 or device_index >= len(devices):
+                raise IndexError("Device index %s out of range (track '%s' has %d devices)"
+                                 % (device_index, track.name, len(devices)))
+            name = devices[device_index].name
+            self._check_expected_name("device %d" % device_index, name, expected_name)
+            track.delete_device(device_index)
+            return {"deleted": True, "name": name, "track_name": track.name}
+        except Exception as e:
+            self.log_message("Error deleting device: " + str(e))
+            raise
+
+    def _delete_nested_device(self, track_index, device_index, chain_index=None, pad_note=None,
+                              nested_device_index=0, path=None, expected_name=None):
+        try:
+            device, location, chain, index = self._resolve_nested_device(
+                track_index, device_index, chain_index, pad_note, nested_device_index, path)
+            self._check_expected_name("nested device", device.name, expected_name)
+            name = device.name
+            chain.delete_device(index)
+            return {"deleted": True, "name": name, "location": location}
+        except Exception as e:
+            self.log_message("Error deleting nested device: " + str(e))
             raise
 
 
@@ -1894,7 +2011,7 @@ class AbletonMCP(ControlSurface):
         pad_note (Drum Racks only) picks the chain; nested_device_index picks
         the device in it. path continues deeper as [chain, device, ...] pairs,
         e.g. a drum pad's Instrument Rack -> its Simpler is path=[0, 0].
-        Returns (device, location string).
+        Returns (device, location string, parent chain, index in that chain).
         """
         track, rack = self._track_device(track_index, device_index)
         if not getattr(rack, "can_have_chains", False):
@@ -1945,12 +2062,13 @@ class AbletonMCP(ControlSurface):
                                      % (step, device.name, len(device.chains)))
                 chain = device.chains[step]
                 location.append("chain %d '%s'" % (step, chain.name))
-        return device, " > ".join(location)
+        # steps ends on a device step, so chain is that device's parent.
+        return device, " > ".join(location), chain, steps[-1]
 
     def _get_nested_device_parameters(self, track_index, device_index, chain_index=None,
                                       pad_note=None, nested_device_index=0, path=None):
         try:
-            device, location = self._resolve_nested_device(
+            device, location, _, _ = self._resolve_nested_device(
                 track_index, device_index, chain_index, pad_note, nested_device_index, path)
             return {
                 "location": location,
@@ -1964,7 +2082,7 @@ class AbletonMCP(ControlSurface):
                                      pad_note=None, nested_device_index=0, path=None,
                                      parameter_index=None, parameter_name=None):
         try:
-            device, location = self._resolve_nested_device(
+            device, location, _, _ = self._resolve_nested_device(
                 track_index, device_index, chain_index, pad_note, nested_device_index, path)
             params = list(device.parameters)
             if (parameter_index is None) == (parameter_name is None):

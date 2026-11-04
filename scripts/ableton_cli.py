@@ -473,8 +473,11 @@ def cmd_selftest_returns(client: Client, via_server: bool) -> int:
                     f"{name!r} at index {index}")
 
             ops.load(index, reverb, "return")
-            on_return = [d["name"] for d in snapshot(client)["return_tracks"][index]["devices"]]
+            ret = snapshot(client)["return_tracks"][index]
+            on_return = [d["name"] for d in ret["devices"]]
             c.check("Reverb on return", on_return == ["Reverb"], str(on_return))
+            # Live renames an auto-named return after its first device ("C-Return" -> "C-Reverb").
+            name = ret["name"]
 
             ops.run("set_send", track_index=track, send_index=index, db=-10.0)
             s = client.send("get_mixer", {"track_index": track})["sends"][index]
@@ -581,6 +584,19 @@ def _peak_meters(ops, track, seconds=1.0, every=0.1):
     return t_peak, m_peak
 
 
+def _wait_for_silence(ops, track, timeout=5.0, threshold=0.01):
+    """Seconds until both meters fall below threshold (Live holds the last
+    peak for up to ~1 s after stopping), or None on timeout."""
+    start = time.time()
+    while time.time() - start < timeout:
+        t = ops.run("get_track_info", track_index=track).get("output_meter_level") or 0.0
+        m = ops.run("get_session_info")["master_track"].get("output_meter_level") or 0.0
+        if t < threshold and m < threshold:
+            return time.time() - start
+        time.sleep(0.1)
+    return None
+
+
 def cmd_selftest_meters(client: Client, via_server: bool) -> int:
     ops = make_ops(client, via_server)
     c = Checker()
@@ -605,10 +621,14 @@ def cmd_selftest_meters(client: Client, via_server: bool) -> int:
             client.send("stop_clip", {"track_index": track, "clip_index": 0})
             client.send("stop_playback")
         try:
-            time.sleep(2.0)
+            silent_after = _wait_for_silence(ops, track)
+            playing = ops.run("get_session_info")["is_playing"]
+            c.check("transport stopped", playing is False)
+            c.check("meters fall to ~0", silent_after is not None,
+                    "timed out after 5 s" if silent_after is None else f"< 0.01 after {silent_after:.1f} s")
             stop_t, stop_m = _peak_meters(ops, track, 0.5)
-            c.check("track meter stopped", stop_t < 0.01, f"peak {stop_t:.4f} (before play {quiet_t:.4f})")
-            c.check("master meter stopped", stop_m < 0.01, f"peak {stop_m:.4f} (before play {quiet_m:.4f})")
+            c.check("meters stay at ~0", stop_t < 0.01 and stop_m < 0.01,
+                    f"track {stop_t:.4f}, master {stop_m:.4f} (before play {quiet_t:.4f}, {quiet_m:.4f})")
         except CommandError as e:
             c.check("meter commands", False, str(e))
     return c.finish()

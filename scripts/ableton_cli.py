@@ -864,6 +864,219 @@ def cmd_selftest_grooves(client: Client, via_server: bool) -> int:
     return c.finish()
 
 
+# --------------------------------------------------------------------------
+# Day-5 selftests (E2E run 1 gaps)
+# --------------------------------------------------------------------------
+
+def _kit_pads(client: Client, track: int):
+    pads = client.send("get_drum_pads", {"track_index": track})["pads"]
+    by_note = {p["note"]: p for p in pads}
+    hat = next((p for p in pads if "hat" in p["name"].lower() and "open" not in p["name"].lower()), by_note.get(42))
+    return pads, by_note[36], by_note[38], hat
+
+
+def cmd_selftest_notewrite(client: Client, via_server: bool) -> int:
+    """Compact notes, repeats, write_drum_pattern and compact read-back are
+    server-side tools, so both modes call them through the server; the result
+    is checked over the raw socket."""
+    server = ServerOps()
+    c = Checker()
+    with temp_track(client) as track:
+        client.send("load_browser_item", {"track_index": track, "item_uri": browser_uri(client, "drums", DRUM_KIT)})
+        print(f"selftest-notewrite (server-side tools, both modes): temp track {track} with {DRUM_KIT}")
+        try:
+            out = server.run("create_clip", track_index=track, clip_index=0, length=16.0, name="Bass Line",
+                             notes=[[36, 0, 0.5, 110], [36, 1.5, 0.5, 90], [43, 3, 0.75, 100]],
+                             repeat_every_beats=4)["message"]
+            raw = client.send("get_clip_notes", {"track_index": track, "clip_index": 0})
+            starts = sorted(n["start_time"] for n in raw["notes"])
+            c.check("create_clip + notes", raw["clip_name"] == "Bass Line" and raw["note_count"] == 12
+                    and starts[:3] == [0.0, 1.5, 3.0] and starts[-1] == 15.0, f"{raw['note_count']} notes")
+            groove = client.send("get_track_info", {"track_index": track})["clip_slots"][0]["clip"]["groove"]
+            c.info("new clip groove", f"{groove!r} (create_clip reports it: {'groove' in out})")
+
+            pads, kick, snare, hat = _kit_pads(client, track)
+            pattern = {kick["name"]: "x...x...x...x...", "Snare": "....x.......x...",
+                       str(hat["note"]): "x.x.x.x.x.x.x.X."}
+            server.run("write_drum_pattern", track_index=track, clip_index=1, pattern=pattern, name="Beat")
+            beat = client.send("get_clip_notes", {"track_index": track, "clip_index": 1})
+            by_pitch = {}
+            for n in beat["notes"]:
+                by_pitch.setdefault(n["pitch"], []).append(n)
+            ok = (sorted(n["start_time"] for n in by_pitch.get(kick["note"], [])) == [0, 1, 2, 3]
+                  and sorted(n["start_time"] for n in by_pitch.get(snare["note"], [])) == [1, 3]
+                  and len(by_pitch.get(hat["note"], [])) == 8
+                  and max(n["velocity"] for n in by_pitch[hat["note"]]) == 127)
+            c.check("write_drum_pattern", ok and beat["clip_name"] == "Beat",
+                    f"{kick['name']}={kick['note']}, Snare->{snare['note']}, {hat['note']}: {beat['note_count']} notes")
+
+            try:
+                server.run("write_drum_pattern", track_index=track, clip_index=2, pattern={"Cowbell": "x..."})
+                c.check("unknown pad refused", False, "Cowbell accepted")
+            except CommandError as e:
+                c.check("unknown pad refused", "No pad 'Cowbell'" in str(e))
+
+            compact = server.run("get_clip_notes", track_index=track, clip_index=1, compact=True)
+            want = sorted([[n["pitch"], n["start_time"], n["duration"], int(n["velocity"])] for n in beat["notes"]],
+                          key=lambda r: (r[1], r[0]))
+            c.check("compact read-back", compact["notes"] == want, f"{len(compact['notes'])} rows")
+        except CommandError as e:
+            c.check("note writing tools", False, str(e))
+    return c.finish()
+
+
+def cmd_selftest_devparams(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    returns = client.send("get_session_info")["return_track_count"]
+    master_n = len(snapshot(client)["master_track"]["devices"])
+    name = None
+    limiter = False
+    with temp_track(client) as track:
+        client.send("load_browser_item", {"track_index": track, "item_uri": browser_uri(client, "drums", DRUM_KIT)})
+        print(f"selftest-devparams via {ops.label}: temp track {track}, master Limiter, new return Reverb")
+        try:
+            rack = ops.run("get_device_parameters", track_index=track, device_index=0, include_chains=False) \
+                if not via_server else ops.run("get_device_parameters", track_index=track, device_index=0)
+            size = len(json.dumps(rack))
+            full = len(json.dumps(client.send("get_device_parameters", {"track_index": track, "device_index": 0})))
+            c.check("drum rack read is shallow", "chains" not in rack["device"] and rack["device"].get("chain_count", 0) > 0
+                    and size < 20000, f"{size // 1024} KB vs {full // 1024} KB with chains")
+
+            client.send("load_browser_item", {"track_index": 0, "item_uri": browser_uri(client, "audio_effects", "Limiter"),
+                                              "track_type": "master"})
+            limiter = True
+            p = ops.run("get_device_parameters", track_index=0, device_index=master_n, track_type="master")
+            ceiling = next(q for q in p["device"]["parameters"] if q["name"].strip() == "Ceiling")
+            new = ceiling["min"] + (ceiling["max"] - ceiling["min"]) * 0.75
+            ops.run("set_device_parameter", track_index=0, device_index=master_n, value=new,
+                    parameter_name="Ceiling", track_type="master")
+            back = next(q for q in ops.run("get_device_parameters", track_index=0, device_index=master_n,
+                                           track_type="master")["device"]["parameters"] if q["name"].strip() == "Ceiling")
+            c.check("master Limiter Ceiling", _close(back["value"], new, 1e-4), f"{ceiling['value']:g} -> {back['value']:g}")
+
+            client.send("create_return_track")
+            client.send("load_browser_item", {"track_index": returns, "item_uri": browser_uri(client, "audio_effects", "Reverb"),
+                                              "track_type": "return"})
+            name = snapshot(client)["return_tracks"][returns]["name"]
+            ops.run("set_device_parameter", track_index=returns, device_index=0, value=8.0,
+                    parameter_name="Decay Time", track_type="return")
+            decay = next(q for q in ops.run("get_device_parameters", track_index=returns, device_index=0,
+                                            track_type="return", **({"name_filter": "decay"} if via_server else {}))
+                         ["device"]["parameters"] if q["name"].strip() == "Decay Time")
+            c.check("return Reverb Decay Time", _close(decay["value"], 8.0, 1e-3), decay.get("value_string", ""))
+            try:
+                ops.run("set_device_parameter", track_index=0, device_index=master_n, value=99.0,
+                        parameter_name="Ceiling", track_type="master")
+                c.check("out-of-range refused", False, "99 accepted")
+            except CommandError as e:
+                c.check("out-of-range refused", "takes" in str(e))
+        except CommandError as e:
+            c.check("device parameter commands", False, str(e))
+        finally:
+            if limiter:
+                client.send("delete_device", {"track_index": 0, "device_index": master_n, "track_type": "master",
+                                              "expected_name": "Limiter"})
+            if name is not None:
+                client.send("delete_return_track", {"return_index": returns, "expected_name": name})
+    snap = snapshot(client)
+    c.check("cleaned up", len(snap["return_tracks"]) == returns and len(snap["master_track"]["devices"]) == master_n)
+    return c.finish()
+
+
+def cmd_selftest_levels(client: Client, via_server: bool) -> int:
+    """measure_levels is a server-side tool (using get_meters when present);
+    both modes call it through the server."""
+    server = ServerOps()
+    c = Checker()
+    with temp_track(client) as track:
+        client.send("load_browser_item", {"track_index": track, "item_uri": browser_uri(client, "drums", DRUM_KIT)})
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+        client.send("add_notes_to_clip", {"track_index": track, "clip_index": 0, "notes": [
+            {"pitch": 36, "start_time": float(b), "duration": 0.25, "velocity": 127, "mute": False} for b in range(4)]})
+        print(f"selftest-levels (server-side tool, both modes): temp track {track}, kick loop")
+        try:
+            meters = client.send("get_meters")
+            c.check("get_meters", len(meters["tracks"]) == client.send("get_session_info")["track_count"]
+                    and "master" in meters, f"{len(meters['tracks'])} tracks, {len(meters['returns'])} returns")
+            client.send("fire_clip", {"track_index": track, "clip_index": 0})
+            time.sleep(2.5)
+            out = server.run("measure_levels", seconds=3.0, settle_seconds=1.0)
+            t = next(x for x in out["tracks"] if x["index"] == track)
+            others = [x["peak"] for x in out["tracks"] if x["index"] != track and x["peak"] is not None]
+            c.check("measure_levels while playing", out["source"] == "get_meters" and t["peak"] > 0.05
+                    and out["master"]["peak"] > 0.05 and all(p < 0.01 for p in others),
+                    f"{out['samples']} samples, track peak {t['peak']} mean {t['mean']}, master {out['master']['peak']}")
+        except CommandError as e:
+            c.check("level commands", False, str(e))
+        finally:
+            client.send("stop_clip", {"track_index": track, "clip_index": 0})
+            client.send("stop_playback")
+    return c.finish()
+
+
+def cmd_selftest_search(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    print(f"selftest-search via {ops.label}")
+    try:
+        args = {"query": "808 core kit"}
+        args.update({"category": "drums"} if via_server else {"roots": ["drums"]})
+        r = ops.run("search_browser", **args)
+        c.check("find a drum kit", any(x["name"] == DRUM_KIT for x in r["results"]),
+                f"{r['count']} result(s): {', '.join(x['name'] for x in r['results'][:3])}")
+        args = {"query": "reverb", "limit": 5}
+        args.update({"category": "audio_effects"} if via_server else {"roots": ["audio_effects"]})
+        r = ops.run("search_browser", **args)
+        c.check("limit respected", 0 < r["count"] <= 5, f"{r['count']} results")
+        uri = next(x["uri"] for x in r["results"] if x["is_loadable"])
+        with temp_track(client) as track:
+            ops.load(track, uri)
+            devices = client.send("get_track_info", {"track_index": track})["devices"]
+            c.check("result loads", len(devices) == 1, devices[0]["name"] if devices else "nothing loaded")
+        if via_server:
+            listing = ops.run("get_browser_items_at_path", path="drums", limit=3)
+            c.check("listing capped", len(listing["items"]) == 3 and "truncated" in listing,
+                    f"3 of {listing['total_items']}")
+    except CommandError as e:
+        c.check("search commands", False, str(e))
+    return c.finish()
+
+
+def cmd_selftest_groovefix(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    with temp_track(client) as track:
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+        client.send("create_clip", {"track_index": track, "clip_index": 1, "length": 4.0})
+        session = client.send("get_session_info")
+        pool = client.send("get_groove_pool")
+        inherited = client.send("get_track_info", {"track_index": track})["clip_slots"][0]["clip"]["groove"]
+        print(f"selftest-groovefix via {ops.label}: temp track {track}")
+        c.check("groove_amount in session info", session.get("groove_amount") == pool["global_amount"],
+                f"{session.get('groove_amount')}")
+        c.info("new clip groove", f"{inherited!r} with global amount {pool['global_amount']:g}")
+        try:
+            if via_server:
+                ops.run("clear_clip_groove", track_index=track, clip_indexes=[0, 1])
+            else:
+                for slot in (0, 1):
+                    ops.run("clear_clip_groove", track_index=track, clip_index=slot)
+            slots = client.send("get_track_info", {"track_index": track})["clip_slots"]
+            names = {slots[0]["clip"]["groove"], slots[1]["clip"]["groove"]}
+            neutral = next((g for g in client.send("get_groove_pool")["grooves"] if g["name"] in names), None)
+            c.check("clips play straight", len(names) == 1 and neutral is not None
+                    and all(neutral[k] == 0 for k in ("timing", "random", "velocity", "quantize")),
+                    f"{names.pop()} (all amounts 0)")
+            before = len(client.send("get_groove_pool")["grooves"])
+            ops.run("clear_clip_groove", track_index=track, clip_index=0)
+            c.check("neutral groove reused", len(client.send("get_groove_pool")["grooves"]) == before)
+        except CommandError as e:
+            c.check("groove commands", False, str(e))
+    c.info("groove pool", "the neutral groove stays in the Set's pool (Live's API can't remove pool grooves)")
+    return c.finish()
+
+
 SELFTESTS = {
     "selftest-notes": cmd_selftest_notes,
     "selftest-connection": cmd_selftest_connection,
@@ -876,6 +1089,11 @@ SELFTESTS = {
     "selftest-arrangement": cmd_selftest_arrangement,
     "selftest-noteedit": cmd_selftest_noteedit,
     "selftest-grooves": cmd_selftest_grooves,
+    "selftest-notewrite": cmd_selftest_notewrite,
+    "selftest-devparams": cmd_selftest_devparams,
+    "selftest-levels": cmd_selftest_levels,
+    "selftest-search": cmd_selftest_search,
+    "selftest-groovefix": cmd_selftest_groovefix,
 }
 
 

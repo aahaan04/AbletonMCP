@@ -36,7 +36,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.10.0"
+SCRIPT_VERSION = "1.11.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -107,6 +107,9 @@ SCRIPT_CAPABILITIES = [
     "assign_groove",
     "set_groove_amount",
     "set_groove_params",
+    "get_meters",
+    "search_browser",
+    "clear_clip_groove",
 ]
 
 # New parameters on existing commands. Older scripts silently ignore unknown
@@ -117,6 +120,8 @@ SCRIPT_FEATURES = [
     "delete_arrangement_clip",
     # load_browser_item accepts track_type return/master (else: loads onto regular track N)
     "load_on_return_or_master",
+    # get/set_device_parameter accept track_type and parameter_name (else: track N, index 0)
+    "device_params_anywhere",
 ]
 
 # Queue bounds limit the work accepted and executed during one Live callback.
@@ -742,9 +747,18 @@ class AbletonMCP(ControlSurface):
                 clip_index = params.get("clip_index", 0)
                 response["result"] = self._get_clip_notes(track_index, clip_index)
             elif command_type == "get_device_parameters":
-                track_index = params.get("track_index", 0)
-                device_index = params.get("device_index", 0)
-                response["result"] = self._get_device_parameters(track_index, device_index)
+                response["result"] = self._get_device_parameters(
+                    params.get("track_index", 0), params.get("device_index", 0),
+                    params.get("track_type", "track"), params.get("include_chains", True))
+            elif command_type == "get_meters":
+                response["result"] = self._get_meters()
+            elif command_type == "search_browser":
+                response["result"] = self._search_browser(
+                    params.get("query", ""), params.get("roots"),
+                    params.get("limit", 25), params.get("loadable_only", True))
+            elif command_type == "clear_clip_groove":
+                response["result"] = self._clear_clip_groove(
+                    params.get("track_index", 0), params.get("clip_index", 0))
             elif command_type == "get_session_snapshot":
                 include_notes = params.get("include_notes", True)
                 include_params = params.get("include_params", True)
@@ -776,8 +790,10 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._set_device_parameter(
                     params.get("track_index", 0),
                     params.get("device_index", 0),
-                    params.get("parameter_index", 0),
+                    params.get("parameter_index"),
                     params.get("value", 0.0),
+                    track_type=params.get("track_type", "track"),
+                    parameter_name=params.get("parameter_name"),
                 )
             else:
                 response["status"] = "error"
@@ -835,6 +851,8 @@ class AbletonMCP(ControlSurface):
                 "loop":              self._safe_song_property("loop",              bool,  False),
                 "loop_start":        self._safe_song_property("loop_start",        float, 0.0),
                 "loop_length":       self._safe_song_property("loop_length",       float, 0.0),
+                # 0.0..1.3; a new Live 12 Set starts at 0, which silences every groove.
+                "groove_amount":     self._safe_song_property("groove_amount",     float, None),
             }
             result["master_track"].update(self._output_meters(self._song.master_track))
             return result
@@ -899,6 +917,24 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting track info: " + str(e))
             raise
     
+    def _get_meters(self):
+        """Every track, return and master meter in one light read (no clip
+        slots or devices), for sampling levels over time."""
+        def entry(i, track):
+            m = self._output_meters(track)
+            return {"index": i, "name": track.name, "level": m["output_meter_level"],
+                    "left": m["output_meter_left"], "right": m["output_meter_right"]}
+
+        master = self._output_meters(self._song.master_track)
+        return {
+            "song_time": self._safe_song_property("current_song_time", float, 0.0),
+            "is_playing": self._safe_song_property("is_playing", bool, False),
+            "tracks": [entry(i, t) for i, t in enumerate(self._song.tracks)],
+            "returns": [entry(i, t) for i, t in enumerate(self._song.return_tracks)],
+            "master": {"level": master["output_meter_level"], "left": master["output_meter_left"],
+                       "right": master["output_meter_right"]},
+        }
+
     def _output_meters(self, track):
         """Read Live Track output meters; unsupported/invalid values are null."""
         result = {}
@@ -2853,6 +2889,55 @@ class AbletonMCP(ControlSurface):
         self._song.groove_amount = amount
         return {"global_amount": float(self._song.groove_amount)}
 
+    # Live's API rejects clip.groove = None, so "no groove" is a pool groove
+    # with every amount at 0. It is made once per Set from Live's stock
+    # "Quantize 16" and renamed so nothing else shares (and changes) it.
+    NEUTRAL_GROOVE = "AbletonMCP No Groove"
+    _NEUTRAL_SOURCE = "Quantize 16"
+
+    def _is_neutral(self, g):
+        return all(float(getattr(g, a)) == 0.0 for a in
+                   ("timing_amount", "random_amount", "velocity_amount", "quantization_amount"))
+
+    def _neutral_groove(self):
+        grooves = self._grooves()
+        for g in grooves:
+            # Fallback name if this Live version refuses the rename below.
+            if g.name == self.NEUTRAL_GROOVE or (g.name == self._NEUTRAL_SOURCE and self._is_neutral(g)):
+                return g
+        item = self._find_groove_item(self._NEUTRAL_SOURCE)
+        if item is None:
+            raise Exception("Live's '%s' groove was not found in Core Library > Grooves"
+                            % self._NEUTRAL_SOURCE)
+        before = len(grooves)
+        self.application().browser.load_item(item)
+        grooves = self._grooves()
+        if len(grooves) != before + 1:
+            raise Exception("Loading '%s' did not add a new groove to the pool" % self._NEUTRAL_SOURCE)
+        g = grooves[before]
+        for attr in ("timing_amount", "random_amount", "velocity_amount", "quantization_amount"):
+            setattr(g, attr, 0.0)
+        if not self._is_neutral(g):
+            raise Exception("Could not zero the amounts of '%s'" % g.name)
+        try:
+            g.name = self.NEUTRAL_GROOVE
+        except Exception as e:
+            self.log_message("Groove rename refused, keeping '%s': %s" % (g.name, e))
+        return g
+
+    def _clear_clip_groove(self, track_index, clip_index):
+        try:
+            _, clip = self._automation_clip(track_index, clip_index, "session")
+            g = self._neutral_groove()
+            if not self._is_neutral(g):
+                raise Exception("'%s' no longer has all amounts at 0; reset it with "
+                                "set_groove_params" % g.name)
+            clip.groove = g
+            return {"clip_name": clip.name, "groove": str(clip.groove.name)}
+        except Exception as e:
+            self.log_message("Error clearing clip groove: " + str(e))
+            raise
+
     def _set_groove_params(self, groove_index, timing=None, random=None, velocity=None, quantize=None):
         grooves = self._grooves()
         if groove_index < 0 or groove_index >= len(grooves):
@@ -3237,7 +3322,8 @@ class AbletonMCP(ControlSurface):
     # a snapshot can never blow the stack or the payload size.
     _MAX_CHAIN_DEPTH = 4
 
-    def _serialize_device(self, device, device_index, include_params=True, depth=0):
+    def _serialize_device(self, device, device_index, include_params=True, depth=0,
+                          include_chains=True):
         info = {
             "index": device_index,
             "name": device.name,
@@ -3283,7 +3369,10 @@ class AbletonMCP(ControlSurface):
         # nested Operator, an instrument rack's filter. Without this walk a rack
         # contributes only its 8 macros and the timbral state is invisible.
         if getattr(device, "can_have_chains", False):
-            if depth >= self._MAX_CHAIN_DEPTH:
+            if not include_chains:
+                # A drum kit's full chain dump runs to hundreds of KB.
+                info["chain_count"] = len(getattr(device, "chains", []))
+            elif depth >= self._MAX_CHAIN_DEPTH:
                 info["chains_truncated"] = True
             else:
                 info["chains"] = self._serialize_chains(
@@ -3504,17 +3593,20 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting clip notes: " + str(e))
             raise
 
-    def _get_device_parameters(self, track_index, device_index):
+    def _get_device_parameters(self, track_index, device_index, track_type="track",
+                               include_chains=True):
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
+            track = self._resolve_track(track_index, track_type)
             if device_index < 0 or device_index >= len(track.devices):
-                raise IndexError("Device index out of range")
+                raise IndexError("Device index %s out of range ('%s' has %d devices)"
+                                 % (device_index, track.name, len(track.devices)))
             device = track.devices[device_index]
             return {
                 "track_index": track_index,
-                "device": self._serialize_device(device, device_index, include_params=True),
+                "track_type": (track_type or "track").lower(),
+                "track_name": track.name,
+                "device": self._serialize_device(device, device_index, include_params=True,
+                                                 include_chains=include_chains),
             }
         except Exception as e:
             self.log_message("Error getting device parameters: " + str(e))
@@ -3597,26 +3689,29 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting session snapshot: " + str(e))
             raise
 
-    def _set_device_parameter(self, track_index, device_index, parameter_index, value):
+    def _set_device_parameter(self, track_index, device_index, parameter_index, value,
+                              track_type="track", parameter_name=None):
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
+            track = self._resolve_track(track_index, track_type)
             if device_index < 0 or device_index >= len(track.devices):
-                raise IndexError("Device index out of range")
+                raise IndexError("Device index %s out of range ('%s' has %d devices)"
+                                 % (device_index, track.name, len(track.devices)))
             device = track.devices[device_index]
-            if parameter_index < 0 or parameter_index >= len(device.parameters):
-                raise IndexError("Parameter index out of range")
-            param = device.parameters[parameter_index]
+            parameter_index, param = self._pick_parameter(device, parameter_index, parameter_name)
+            value = float(value)
+            if value < param.min or value > param.max:
+                raise ValueError("%s takes %s..%s, got %s" % (param.name.strip(), param.min, param.max, value))
             old = float(param.value)
-            param.value = float(value)
+            param.value = value
             return {
                 "track_index": track_index,
+                "track_type": (track_type or "track").lower(),
                 "device_index": device_index,
                 "parameter_index": parameter_index,
-                "name": param.name,
+                "name": param.name.strip(),
                 "old_value": old,
                 "value": float(param.value),
+                "display": param.str_for_value(param.value),
                 "min": float(param.min),
                 "max": float(param.max),
             }
@@ -3770,6 +3865,62 @@ class AbletonMCP(ControlSurface):
             self.log_message(traceback.format_exc())
             raise
     
+    _SEARCH_ITEM_BUDGET = 5000
+
+    def _browser_root(self, path):
+        """The browser item at "category/folder/...", or None."""
+        browser = self.application().browser
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            return None
+        attr = parts[0].lower()
+        item = getattr(browser, attr, None) if hasattr(browser, attr) else None
+        for part in parts[1:]:
+            if item is None:
+                return None
+            item = next((c for c in item.children if str(c.name).lower() == part.lower()), None)
+        return item
+
+    def _search_browser(self, query, roots=None, limit=25, loadable_only=True):
+        """Breadth-first name search below the given browser paths. Every
+        word of the query must appear in the name (case-insensitive)."""
+        words = [w for w in str(query).lower().split() if w]
+        if not words:
+            raise ValueError("query is empty")
+        limit = max(1, min(int(limit), 200))
+        roots = roots or ["instruments", "sounds", "drums", "audio_effects", "midi_effects", "user_library"]
+        results, examined, missing = [], 0, []
+        queue = []
+        for path in roots:
+            item = self._browser_root(path)
+            if item is None:
+                missing.append(path)
+            else:
+                queue.append((path, item))
+        while queue and len(results) < limit and examined < self._SEARCH_ITEM_BUDGET:
+            path, item = queue.pop(0)
+            for child in item.children:
+                examined += 1
+                name = str(child.name)
+                child_path = path + "/" + name
+                loadable = bool(getattr(child, "is_loadable", False))
+                if all(w in name.lower() for w in words) and (loadable or not loadable_only):
+                    results.append({"name": name, "path": child_path,
+                                    "uri": getattr(child, "uri", None),
+                                    "is_loadable": loadable,
+                                    "is_folder": bool(getattr(child, "is_folder", False))})
+                    if len(results) >= limit:
+                        break
+                if getattr(child, "is_folder", False):
+                    queue.append((child_path, child))
+        out = {"query": query, "results": results, "count": len(results), "items_examined": examined}
+        if examined >= self._SEARCH_ITEM_BUDGET and len(results) < limit:
+            out["note"] = ("stopped after %d items; search a narrower category or path for more"
+                           % self._SEARCH_ITEM_BUDGET)
+        if missing:
+            out["unknown_roots"] = missing
+        return out
+
     def get_browser_items_at_path(self, path):
         """
         Get browser items at a specific path.

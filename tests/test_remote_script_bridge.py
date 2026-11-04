@@ -294,7 +294,7 @@ def test_reads_and_writes_run_only_in_live_callback(
     inst = make_instance(script_module)
     calls = []
 
-    def execute(*args):
+    def execute(*args, **kwargs):   # kwargs: optional params such as track_type
         calls.append((threading.current_thread().ident, args))
         return {"verified": command}
 

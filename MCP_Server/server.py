@@ -423,8 +423,11 @@ def get_session_info(ctx: Context, user_prompt: str = "") -> str:
 
     master_track includes output_meter_left / output_meter_right /
     output_meter_level: Live's instantaneous output meters, 0..1 (1 = clipping
-    at 0 dBFS), or null where Live has no reading. They are live peaks, so
-    sample a few times while playing to judge loudness.
+    at 0 dBFS), or null where Live has no reading. To judge loudness use
+    measure_levels, which samples over time.
+
+    groove_amount is the global groove amount (0..1.3). A new Live 12 Set
+    starts at 0, so assigned grooves are silent until it is raised.
 
     Parameters:
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
@@ -2364,8 +2367,9 @@ def clear_clip_groove(
 
     Live's API cannot set a clip's groove to None, so this assigns a neutral
     groove instead: "AbletonMCP No Groove" in the Set's Groove Pool (Live's
-    "Quantize 16" with timing, random, velocity and quantize all 0), loaded
-    the first time it's needed. Don't change that groove's amounts.
+    "Quantize 16" with timing, random, velocity and quantize all 0, keeping
+    that name if Live refuses the rename), loaded the first time it's
+    needed. Don't change that groove's amounts.
 
     A new Live 12 Set gives every new clip its default groove ("Swing 16ths
     66"); clear it on clips that should stay straight before raising the

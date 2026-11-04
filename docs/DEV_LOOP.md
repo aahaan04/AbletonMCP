@@ -19,7 +19,8 @@ uv run python scripts\ableton_cli.py selftest-notes --via-server   # through MCP
 uv run python scripts\ableton_cli.py get_track_info track_index=0  # any command
 
 # Run every selftest both ways (PowerShell):
-foreach ($t in 'notes','connection','mixer','drums','deletes','returns','automation','meters') {
+foreach ($t in 'notes','connection','mixer','drums','deletes','returns','automation','meters',
+              'arrangement','noteedit','grooves') {
   foreach ($v in '', '--via-server') { uv run python scripts\ableton_cli.py "selftest-$t" $v } }
 
 # 3. Unit tests (no Live needed).
@@ -47,9 +48,13 @@ extra returns.
 | `selftest-returns` | new return + Reverb, send to it, Limiter on master → read back → removed |
 | `selftest-automation` | 8-bar Auto Filter sweep + volume fade → sampled back → clear one, clear all; probes Arrangement (Live refuses) |
 | `selftest-meters` | kick loop: track/master meters > 0.05 while playing, fall < 0.01 after stop (Live holds the peak up to ~3 s) |
+| `selftest-arrangement` | two temp tracks: intro/main/outro sections (bars 1-8/9-16/17-24) placed and read back exactly; filter envelope verified by playing the section soloed; refusals; locators and loop set, then removed/restored. Aborts if one of your locators sits at bar 1, 9 or 17 |
+| `selftest-noteedit` | 12-note drum pattern: transpose by id, velocity by range, shift+duration, delete one, invalid edit refused → exact notes and ids |
+| `selftest-grooves` | load "Swing MPC 3000 8ths 57", assign to a hat clip, read back. Leaves the groove in the Set's pool (Live's API can't remove it) |
 
 Set `PYTHONIOENCODING=utf-8` if the console mangles the multi-byte output.
-`selftest-meters` plays audio for a few seconds.
+`selftest-meters` plays audio for a few seconds; `selftest-arrangement` plays the
+Arrangement for ~3 s with only a temp track soloed.
 
 ## Batching Remote Script changes
 

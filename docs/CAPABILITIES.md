@@ -1,11 +1,11 @@
 # AbletonMCP capabilities audit
 
-Snapshot of `dev` as of 2026-11-03 (package 1.4.5, Remote Script 1.9.0), measured
+Snapshot of `dev` as of 2026-11-03 (package 1.4.5, Remote Script 1.10.0), measured
 against the goal: Claude produces a full track in Live end to end with no manual steps.
 
 ## 1. What the MCP can do today
 
-54 MCP tools (`MCP_Server/server.py`). Session-view clips are addressed by
+66 MCP tools (`MCP_Server/server.py`). Session-view clips are addressed by
 `(track_index, clip_index)`. Mixer, device loading and device deletes also reach
 return tracks and the master via `track_type`. Since upstream #140, every command
 runs on Live's main thread through a bounded queue (64 pending, 8 per tick, 10 s
@@ -47,7 +47,7 @@ deadline; 60 s for audio import).
 - `write_clip_automation` — draw an envelope from breakpoints (`value` in the parameter's units or `normalized` 0..1; linear or step), for mixer volume/pan/sends or any device parameter, including devices inside racks.
 - `get_clip_automation` — sample an envelope at given beats; reports `has_envelope`.
 - `clear_clip_automation` — remove one parameter's envelope, or all with `all_parameters=true`.
-- **Arrangement limitation (verified in Live 12.4):** clip envelopes cannot be created on Arrangement clips; Live refuses with "Not a session clip or parameter belongs to another track". The LOM also has no API to write track-level Arrangement automation. Workaround: automate the Session clip, then `duplicate_to_arrangement` (the envelope travels with the clip).
+- **Arrangement limitation (verified in Live 12.4):** clip envelopes cannot be created on Arrangement clips; Live refuses with "Not a session clip or parameter belongs to another track". The LOM also has no API to write track-level Arrangement automation. Workaround: automate the Session clip, then `fill_arrangement` / `duplicate_to_arrangement`; the envelope travels with the clip and plays (verified by playback), though it cannot be read back there.
 
 **Devices, racks and browser**
 - `get_browser_tree` — browser category tree.
@@ -60,13 +60,25 @@ deadline; 60 s for audio import).
 - `delete_device` — delete one top-level device (track, return or master).
 - `delete_nested_device` — delete one device inside a rack chain.
 
-**Arrangement**
-- `switch_to_arrangement_view` — show Arrangement.
-- `set_arrangement_time` — move the playhead.
-- `get_arrangement_clips` — list a track's arrangement clips.
-- `duplicate_to_arrangement` — copy a Session clip to a beat position in Arrangement.
-- `set_arrangement_clip_name` — rename an arrangement clip.
-- `create_locator` — named cue point at a beat (upstream PR 146 reports this fails in practice; untested here).
+**Arrangement** (new tools work in bars: bar 1 = beat 0, ranges inclusive)
+- `fill_arrangement` — repeat one Session clip back-to-back over a bar range on its own track; refuses partial repeats and clips in the way (`replace=true` removes only clips wholly inside the range).
+- `fill_arrangement_section` — fill one section for several (track, clip) pairs in one call; all-or-nothing.
+- `get_arrangement_layout` — per track: clips as bar ranges, gaps, overlaps; plus loop and locators.
+- `set_arrangement_loop` — loop brace by bar range, on/off.
+- `set_locator` / `delete_locator` — named section markers at a bar (playback must be stopped). Built from three Remote Script primitives sent as separate commands, because Live applies a playhead move only after the callback that made it; the old single-shot `create_locator` dropped cues at the previous playhead and is removed.
+- `switch_to_arrangement_view`, `set_arrangement_time` (playhead, beats), `get_arrangement_clips`, `duplicate_to_arrangement` (one copy at a beat), `set_arrangement_clip_name`.
+- Clip envelopes travel with `fill_arrangement` copies (verified by playback), but Live does not expose Arrangement clips' envelopes for reading or writing.
+
+**Note editing**
+- `modify_notes` — edit notes in place by `note_ids` or pitch/time range: absolute `pitch`/`velocity`/`start_time` or relative `transpose`/`velocity_delta`/`shift`, plus `duration`, `mute`. All-or-nothing validation; note IDs kept.
+- `delete_notes` — delete notes by the same selection (empty selection refused).
+
+**Grooves**
+- `get_groove_pool` — grooves in the Set (timing/random/velocity/quantize) and global amount.
+- `load_groove` — add a `.agr` from Core Library or User Library > Grooves, by URI or name; reuses one already in the pool.
+- `assign_groove` — set a Session clip's groove; shown per clip in `get_track_info`.
+- `set_groove_amount` (global 0–130%), `set_groove_params` (per groove).
+- **Limits (verified in Live 12.4):** a clip's groove cannot be cleared (`clip.groove = None` is rejected), and grooves cannot be removed from the pool. Neutralise with `set_groove_params` or `set_groove_amount(0)`.
 
 **Dataset / preference recording (opt-in, Supabase)**
 - `set_dataset_consent`, `submit_intent`, `rate_last_action`, `prefer_candidate`,
@@ -86,24 +98,26 @@ Remote Script commands with no MCP tool: `map_rack_magnitude`, `inspect_rack`,
 | Create return tracks; devices on returns and master | ✅ | `create_return_track` ported from #94 (lukegimza); `load_instrument_or_effect(track_type=...)` |
 | Clip automation envelopes | ✅ (Session clips) | `get/write/clear_clip_automation`; Arrangement not possible via the API, see above |
 | Track / master meters | ✅ | Upstream #140 merged (also moves every command to Live's main thread) |
+| Arrangement building (sections, loop, locators, layout read-back) | ✅ | `fill_arrangement(_section)`, `set_arrangement_loop`, `set/delete_locator`, `get_arrangement_layout` |
+| In-place note editing | ✅ | `modify_notes`, `delete_notes` (by note id or range) |
+| Grooves / swing | ✅ (no clear/remove) | Groove pool tools; Live's API can't clear a clip's groove or delete pool grooves |
 
 ## 2. Remaining gaps, prioritised for "full track, no manual steps"
 
-| # | Gap | Why it blocks a finished track | LOM surface | Upstream coverage |
+| # | Gap | Why it matters for a finished track | LOM surface | Upstream coverage |
 |---|-----|------|-------------|------|
-| 1 | **Arrangement building** (place clips across a song form, loop/extend sections, scenes → arrangement) | Today Claude can only copy one Session clip at a time to a beat; no song structure in one step, no section loops | `track.duplicate_clip_to_arrangement`, `song.loop_start/length`, scenes | #146 `fill_arrangement`, `set_arrangement_loop`, `copy_clip` |
-| 2 | **In-place note editing** (move/transpose/velocity on a subset; note IDs) | Workaround works (read → clear → add) but loses note IDs and is chatty for big clips | `clip.apply_note_modifications`, `remove_notes_extended` | #99 `apply_note_modifications` (conflicting) |
-| 3 | **Grooves / swing** | Everything quantised-straight; human feel needs manual work | `song.groove_pool.grooves`, `clip.groove` | #146 (groove-pool round trip + server-side swing) |
-| 4 | **Routing / sidechain** | No sidechain pumping, no group buses | `track.output_routing_type`, `input_routing_type`, compressor sidechain params | #99 routing (conflicting), #146 sidechain |
-| 5 | **Render / listen** | Meters show level, not tone; no bounce to check the mix | resample recording; file analysis | #143 resample export, #133 record/analyse |
+| 1 | **Saving the Set / export** | Live's API has no save, save-as or export, so the user must press Save and File > Export. A finished track that isn't saved is lost on quit | none in the LOM; only UI automation outside Live | #143 records a bounce via resampling (real time), not a true export |
+| 2 | **Long-form automation across clips** | Track automation in the Arrangement can't be written; envelopes live in clips, so a 16-bar riser needs a 16-bar clip | clip envelopes only | none |
+| 3 | **Routing / sidechain / groups** | No sidechain pumping, no group buses, no resampling routes | `track.output_routing_type`, `input_routing_type`, compressor sidechain params | #99 routing (conflicting), #146 sidechain |
+| 4 | **Hearing the result** | Meters show level, not tone or balance; Claude can't judge if the mix sounds right | resample recording + file analysis | #143 resample export, #133 record/analyse, #146 "ears" |
+| 5 | **Clip properties** (loop/length, warp, transpose, gain) and **scenes** | Needed for audio loops and Session-to-Arrangement workflows | `clip.loop_start/end`, `warp_mode`, `pitch_coarse`, `song.create_scene` | #146 `set_clip_properties`, #99 scenes |
 
-Also missing, lower priority: scenes (create/fire/name), clip loop/length edit,
-track colour, undo/redo.
+Also missing, lower priority: track colour, `duplicate_track`, undo/redo.
 
-**Top 3 next features: 1) arrangement building (fill a section from Session clips,
-set loop), 2) in-place note editing, 3) grooves/swing.** Mixing, sound design and
-automation now work; the remaining blocker for an end-to-end track is laying clips
-out into a song form.
+**Top 3 next features: 1) routing and sidechain, 2) clip properties + scenes,
+3) a resample-based bounce so Claude can analyse what it made.** Saving cannot be
+added through the Remote Script API at all; see the end-to-end assessment in the
+day-4 summary.
 
 ## 3. Open upstream PRs that implement these gaps
 
@@ -116,11 +130,11 @@ close them upstream). Upstream base is `9dddc7b`; none have maintainer reviews.
 | [#122](https://github.com/ahujasid/ableton-mcp/pull/122) | `get_mixer`, `set_track_volume` (dB), `set_track_panning`, `set_send` | mixer | **merged into dev** (+ mute/solo follow-up) | — |
 | [#140](https://github.com/ahujasid/ableton-mcp/pull/140) | All commands on Live's main thread via a bounded queue; cancel on timeout/disconnect; output meters | meters + reliability | **merged into dev** (conflicts resolved by flattening our commands into its dispatcher) | — |
 | [#94](https://github.com/ahujasid/ableton-mcp/pull/94) | `create_return_track`, `duplicate_track`, `capture_midi`, `tap_tempo`, `set_track_color` | returns | **`create_return_track` ported** (authored as lukegimza); rest not taken | `duplicate_track` / `set_track_color` are small future ports. |
-| [#146](https://github.com/ahujasid/ableton-mcp/pull/146) | "Studio tools": `fill_arrangement`, `set_arrangement_loop`, `copy_clip`, groove pool, swing, sidechain, render + analysis. +11153/-167 | 1, 3, 4, 5 | mergeable upstream; commits authored as "Claude" | **Don't merge wholesale.** Clip automation here was written fresh using it as an API reference; do the same for arrangement fill and grooves. |
-| [#119](https://github.com/ahujasid/ableton-mcp/pull/119) | Guarded mixer/device batch edits, `replace_clip_notes` with rollback | 2 | conflicts | Port ideas selectively. |
-| [#99](https://github.com/ahujasid/ableton-mcp/pull/99) | ~60 commands incl. `apply_note_modifications`, routing, scenes, undo | 2, 4 | conflicts | Mine for note-modification and routing handlers. |
+| [#146](https://github.com/ahujasid/ableton-mcp/pull/146) | "Studio tools": `copy_clip`, `set_clip_properties`, sidechain, render + analysis ("ears"), skills. +11153/-167 | 3, 4, 5 | mergeable upstream; commits authored as "Claude" | **Don't merge wholesale.** Clip automation, arrangement fill/loop and grooves here were written fresh using it as a reference; do the same for sidechain and clip properties. |
+| [#119](https://github.com/ahujasid/ableton-mcp/pull/119) | Guarded mixer/device batch edits, `replace_clip_notes` with rollback | — | conflicts | Ideas only; note editing is done. |
+| [#99](https://github.com/ahujasid/ableton-mcp/pull/99) | ~60 commands incl. routing, scenes, undo (its `apply_note_modifications` informed `modify_notes`) | 3, 5 | conflicts | Mine for routing and scene handlers. |
 | [#110](https://github.com/ahujasid/ableton-mcp/pull/110), [#84](https://github.com/ahujasid/ableton-mcp/pull/84), [#41](https://github.com/ahujasid/ableton-mcp/pull/41), [#50](https://github.com/ahujasid/ableton-mcp/pull/50), [#23](https://github.com/ahujasid/ableton-mcp/pull/23) | Older mixer/delete/device attempts | — | conflicts | Superseded by what's on dev. |
 | [#133](https://github.com/ahujasid/ableton-mcp/pull/133), [#143](https://github.com/ahujasid/ableton-mcp/pull/143) | Record/analyse Live's output; real-time resample export | "hearing" the mix | mergeable upstream | Later, after meters. |
 
-**Next:** arrangement fill/loop (reference #146) → `apply_note_modifications`
-(reference #99) → groove pool (reference #146).
+**Next:** routing/sidechain (reference #99, #146) → clip properties and scenes
+(reference #146, #99) → resample bounce (reference #143).

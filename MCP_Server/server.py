@@ -117,7 +117,8 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator",
+            "fill_arrangement", "fill_arrangement_section", "set_arrangement_loop",
+            "toggle_cue_at_playhead", "rename_locator",
             # Mixer commands
             "set_track_volume", "set_track_panning", "set_send",
             "set_track_mute", "set_track_solo",
@@ -127,6 +128,8 @@ class AbletonConnection:
             "delete_track", "delete_return_track", "delete_device", "delete_nested_device",
             "create_return_track", "load_browser_item",
             "write_clip_automation", "clear_clip_automation",
+            "modify_notes", "delete_notes",
+            "load_groove", "assign_groove", "set_groove_amount", "set_groove_params",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -1340,44 +1343,511 @@ def duplicate_to_arrangement(
         return f"Error duplicating clip to arrangement: {str(e)}"
 
 
+# ── Arrangement building ──────────────────────────────────────────────────────
+# Bars here are Live's ruler bars: bar 1 starts at beat 0, and bar ranges are
+# inclusive (bars 17-32 = 16 bars). In 4/4 a bar is 4 beats, so bar N starts
+# at beat (N-1)*4. Clip lengths and note/automation times stay in beats.
+
 @mcp.tool()
-@rich_telemetry_tool("create_locator")
-def create_locator(
+@rich_telemetry_tool("fill_arrangement")
+@trajectory_tool("fill_arrangement")
+def fill_arrangement(
     ctx: Context,
-    name: str,
-    time: float,
+    track_index: int,
+    clip_index: int,
+    start_bar: float,
+    end_bar: float,
+    replace: bool = False,
     user_prompt: str = ""
 ) -> str:
     """
-    Create a named locator (cue point) in the Arrangement at a beat position.
+    Place a Session clip into the Arrangement on its own track, repeated
+    back-to-back to fill an inclusive bar range. Example: a 4-bar loop
+    with start_bar=17, end_bar=32 is placed 4 times, at bars 17, 21, 25, 29.
+    Clip automation envelopes travel with the copies.
 
-    If a locator already exists at that beat (within ~1e-3 tolerance) it is
-    renamed instead of toggled off. Time is in beats from the start of the
-    arrangement (e.g. 0.0 = start, 16.0 = bar 5 in 4/4).
+    The range must hold a whole number of repeats of the clip (a 4-bar clip
+    cannot fill 6 bars). Existing arrangement clips in the range are refused
+    unless replace=true, which deletes clips lying entirely inside the range;
+    clips that stick out of it are never cut, the call is refused instead.
+
+    Afterwards call get_arrangement_layout to verify positions, gaps and
+    overlaps.
 
     Parameters:
-    - name: The locator label (e.g. "Chorus", "Verse 1", "Drop")
-    - time: Beat position where the locator should sit
+    - track_index: Track holding the Session clip (the copies go on the same track)
+    - clip_index: Session slot of the clip
+    - start_bar: First bar, 1-based like Live's ruler
+    - end_bar: Last bar, inclusive
+    - replace: Remove arrangement clips lying entirely inside the range first
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("fill_arrangement", {
+            "track_index": track_index, "clip_index": clip_index,
+            "start_bar": start_bar, "end_bar": end_bar, "replace": replace})
+        if isinstance(result, str):
+            return result
+        return (f"Placed '{result['clip_name']}' on '{result['track_name']}' {result['copies']}x "
+                f"at bars {', '.join(f'{b:g}' for b in result['start_bars'])}"
+                + (f" (replaced {result['replaced']} clip(s))" if result.get("replaced") else ""))
+    except Exception as e:
+        logger.error(f"Error filling arrangement: {str(e)}")
+        return f"Error filling arrangement: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("fill_arrangement_section")
+@trajectory_tool("fill_arrangement_section")
+def fill_arrangement_section(
+    ctx: Context,
+    start_bar: float,
+    end_bar: float,
+    placements: List[Dict[str, int]],
+    replace: bool = False,
+    user_prompt: str = ""
+) -> str:
+    """
+    Fill one song section in a single call: every (track, Session clip)
+    pair is placed back-to-back across the same inclusive bar range, as
+    fill_arrangement does for one track. All placements are checked first;
+    if any is invalid (wrong length, clip in the way, empty slot) nothing is
+    placed. Each track may appear once per call.
+
+    Typical song build: one call per section, e.g. intro bars 1-8, main
+    bars 9-24, outro bars 25-32, then set_locator for each section name and
+    get_arrangement_layout to verify.
+
+    Parameters:
+    - start_bar: First bar of the section, 1-based
+    - end_bar: Last bar of the section, inclusive
+    - placements: [{"track_index": 0, "clip_index": 2}, {"track_index": 1, "clip_index": 2}, ...]
+    - replace: Remove arrangement clips lying entirely inside the range first
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("fill_arrangement_section", {
+            "start_bar": start_bar, "end_bar": end_bar,
+            "placements": placements, "replace": replace})
+        if isinstance(result, str):
+            return result
+        lines = [f"- '{p['clip_name']}' on '{p['track_name']}': {p['copies']}x" for p in result["placed"]]
+        return f"Filled bars {start_bar:g}-{end_bar:g}:\n" + "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error filling arrangement section: {str(e)}")
+        return f"Error filling arrangement section: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_arrangement_loop")
+@trajectory_tool("set_arrangement_loop")
+def set_arrangement_loop(
+    ctx: Context,
+    start_bar: float,
+    end_bar: float,
+    enabled: bool = True,
+    user_prompt: str = ""
+) -> str:
+    """
+    Set the Arrangement loop brace to an inclusive bar range (bars 9-16 loops
+    8 bars) and switch looping on or off.
+
+    Parameters:
+    - start_bar: First bar, 1-based
+    - end_bar: Last bar, inclusive
+    - enabled: Loop switch on (default) or off
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("set_arrangement_loop", {
+            "start_bar": start_bar, "end_bar": end_bar, "enabled": enabled})
+        if isinstance(result, str):
+            return result
+        return (f"Loop {'on' if result['loop'] else 'off'}: bars {result['start_bar']:g}-"
+                f"{result['end_bar']:g}")
+    except Exception as e:
+        logger.error(f"Error setting arrangement loop: {str(e)}")
+        return f"Error setting arrangement loop: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_arrangement_layout")
+@trajectory_tool("get_arrangement_layout")
+def get_arrangement_layout(
+    ctx: Context,
+    track_indexes: Optional[List[int]] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Read the Arrangement as bars: each track's clips (start_bar, end_bar
+    inclusive, plus beat times), the gaps and overlaps between them, the
+    loop brace, and the locators. Call this after placing clips to verify
+    the song form.
+
+    Parameters:
+    - track_indexes: Tracks to include (default: all)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("get_arrangement_layout", {"track_indexes": track_indexes})
+        return result if isinstance(result, str) else json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error reading arrangement layout: {str(e)}")
+        return f"Error reading arrangement layout: {str(e)}"
+
+
+# Locators: Live's only locator call toggles one at the playhead, and a
+# playhead move lands only after the Remote Script callback that made it. So
+# each step is its own command, with a short pause for Live to apply it.
+_LOCATOR_SETTLE_SEC = 0.15
+
+
+def _locator_at(ableton, beat: float) -> Optional[Dict[str, Any]]:
+    return next((c for c in ableton.send_command("get_locators")["locators"]
+                 if abs(c["time"] - beat) < 0.01), None)
+
+
+def _move_playhead(ableton, beat: float) -> None:
+    import time as _time
+
+    ableton.send_command("set_current_song_time", {"time": beat})
+    for _ in range(10):
+        _time.sleep(_LOCATOR_SETTLE_SEC)
+        if abs(ableton.send_command("get_session_info")["current_song_time"] - beat) < 0.01:
+            return
+    raise Exception(f"Playhead did not reach beat {beat}")
+
+
+def _toggle_locator(ableton, beat: float) -> None:
+    """Toggle the cue at beat, refusing if the playhead isn't exactly there
+    (a toggle elsewhere would add or delete the wrong locator)."""
+    import time as _time
+
+    if ableton.send_command("get_session_info")["is_playing"]:
+        raise Exception("Stop playback first: locators are placed at the playhead")
+    restore = ableton.send_command("get_session_info")["current_song_time"]
+    _move_playhead(ableton, beat)
+    try:
+        playhead = ableton.send_command("toggle_cue_at_playhead")["playhead"]
+        if abs(playhead - beat) > 0.01:
+            raise Exception(f"Locator toggled at beat {playhead}, not {beat}")
+        _time.sleep(_LOCATOR_SETTLE_SEC)
+    finally:
+        ableton.send_command("set_current_song_time", {"time": restore})
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_locator")
+@trajectory_tool("set_locator")
+def set_locator(
+    ctx: Context,
+    name: str,
+    bar: float,
+    user_prompt: str = ""
+) -> str:
+    """
+    Add a named locator (section marker such as "Intro", "Drop") at the
+    start of a bar, or rename the one already there. Playback must be
+    stopped. The playhead is moved temporarily and restored.
+
+    Parameters:
+    - name: Locator name
+    - bar: Bar number, 1-based (bar 17 = beat 64 in 4/4)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         from .script_handshake import require_capability
 
         ableton = get_ableton_connection()
-        missing = require_capability("create_locator", ableton.send_command)
-        if missing:
-            return missing
-        result = ableton.send_command(
-            "create_locator",
-            {"name": name, "time": time}
-        )
-        return (
-            f"Locator '{result.get('name', name)}' set at beat "
-            f"{result.get('time', time)}"
-        )
+        for cap in ("get_locators", "toggle_cue_at_playhead", "rename_locator"):
+            missing = require_capability(cap, ableton.send_command)
+            if missing:
+                return missing
+        beat = (bar - 1) * ableton.send_command("get_locators")["beats_per_bar"]
+        existed = _locator_at(ableton, beat) is not None
+        if not existed:
+            _toggle_locator(ableton, beat)
+            if _locator_at(ableton, beat) is None:
+                return f"Error setting locator: Live did not create a locator at bar {bar:g}"
+        result = ableton.send_command("rename_locator", {"time": beat, "name": name})
+        return f"{'Renamed' if existed else 'Added'} locator '{result['name']}' at bar {result['bar']:g}"
     except Exception as e:
-        logger.error(f"Error creating locator: {str(e)}")
-        return f"Error creating locator: {str(e)}"
+        logger.error(f"Error setting locator: {str(e)}")
+        return f"Error setting locator: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("delete_locator")
+@trajectory_tool("delete_locator")
+def delete_locator(
+    ctx: Context,
+    bar: float,
+    expected_name: Optional[str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Delete the locator at the start of a bar. Playback must be stopped.
+
+    Parameters:
+    - bar: Bar number, 1-based
+    - expected_name: Optional; refuse unless the locator has exactly this name
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        ableton = get_ableton_connection()
+        for cap in ("get_locators", "toggle_cue_at_playhead"):
+            missing = require_capability(cap, ableton.send_command)
+            if missing:
+                return missing
+        beat = (bar - 1) * ableton.send_command("get_locators")["beats_per_bar"]
+        cue = _locator_at(ableton, beat)
+        if cue is None:
+            return f"Error deleting locator: no locator at bar {bar:g}"
+        if expected_name is not None and cue["name"] != expected_name:
+            return (f"Error deleting locator: Refusing to delete: locator at bar {bar:g} is named "
+                    f"'{cue['name']}', not '{expected_name}'")
+        _toggle_locator(ableton, beat)
+        if _locator_at(ableton, beat) is not None:
+            return f"Error deleting locator: locator at bar {bar:g} is still there"
+        return f"Deleted locator '{cue['name']}' at bar {bar:g}"
+    except Exception as e:
+        logger.error(f"Error deleting locator: {str(e)}")
+        return f"Error deleting locator: {str(e)}"
+
+
+# ── In-place note editing ─────────────────────────────────────────────────────
+
+@mcp.tool()
+@rich_telemetry_tool("modify_notes")
+@trajectory_tool("modify_notes")
+def modify_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    selection: Dict[str, Any],
+    changes: Dict[str, Any],
+    user_prompt: str = ""
+) -> str:
+    """
+    Edit existing notes in a MIDI clip in place, without clearing it. Note
+    IDs are kept. Read the notes first with get_clip_notes.
+
+    selection picks notes in exactly one of two ways:
+    - {"note_ids": [3, 7]}: the note_id values returned by get_clip_notes
+    - a range: any of {"pitch_min": 36, "pitch_max": 38} (inclusive) and
+      {"time_min": 0, "time_max": 4} (beats from the clip start; a note is
+      selected when its start time is >= time_min and < time_max)
+
+    changes applies to every selected note. Absolute or relative, not both
+    for the same property:
+    - "pitch": 60 or "transpose": 7 (semitones, may be negative)
+    - "velocity": 90 or "velocity_delta": -20 (result must stay 1..127)
+    - "start_time": 2.0 or "shift": 0.25 (beats)
+    - "duration": 0.5 (beats)
+    - "mute": true/false
+    If any selected note would end up invalid (pitch outside 0..127,
+    velocity outside 1..127, start before beat 0, duration <= 0), nothing is
+    changed.
+
+    Parameters:
+    - track_index: Track holding the clip
+    - clip_index: Session slot index
+    - selection: Which notes, see above
+    - changes: What to change, see above
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("modify_notes", {
+            "track_index": track_index, "clip_index": clip_index,
+            "selection": selection, "changes": changes})
+        return result if isinstance(result, str) else json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error modifying notes: {str(e)}")
+        return f"Error modifying notes: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("delete_notes")
+@trajectory_tool("delete_notes")
+def delete_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    selection: Dict[str, Any],
+    user_prompt: str = ""
+) -> str:
+    """
+    Delete specific notes from a MIDI clip. To empty the whole clip use
+    clear_notes_from_clip instead; an empty selection is refused.
+
+    selection picks notes in exactly one of two ways:
+    - {"note_ids": [3, 7]}: the note_id values returned by get_clip_notes
+    - a range: any of {"pitch_min": 42, "pitch_max": 42} (inclusive) and
+      {"time_min": 0, "time_max": 4} (beats from the clip start; a note is
+      selected when its start time is >= time_min and < time_max)
+
+    Parameters:
+    - track_index: Track holding the clip
+    - clip_index: Session slot index
+    - selection: Which notes, see above
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("delete_notes", {
+            "track_index": track_index, "clip_index": clip_index, "selection": selection})
+        return result if isinstance(result, str) else json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error deleting notes: {str(e)}")
+        return f"Error deleting notes: {str(e)}"
+
+
+# ── Groove pool ───────────────────────────────────────────────────────────────
+
+@mcp.tool()
+@telemetry_tool("get_groove_pool")
+@trajectory_tool("get_groove_pool")
+def get_groove_pool(ctx: Context, user_prompt: str = "") -> str:
+    """
+    List the grooves in the Set's Groove Pool (index, name, timing, random,
+    velocity, quantize amounts) and the global groove amount. Which groove a
+    clip uses is shown per clip in get_track_info ("groove").
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("get_groove_pool", {})
+        return result if isinstance(result, str) else json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error reading groove pool: {str(e)}")
+        return f"Error reading groove pool: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("load_groove")
+@trajectory_tool("load_groove")
+def load_groove(
+    ctx: Context,
+    uri: Optional[str] = None,
+    name: Optional[str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Add a groove from Live's library to the Groove Pool and return its
+    index for assign_groove. A groove already in the pool is reused.
+
+    Give exactly one of:
+    - uri: from get_browser_items_at_path, e.g. browse
+      "packs/Core Library/Grooves/Swing/MPC"
+    - name: a groove file name such as "Swing MPC 3000 8ths 57" (searched
+      under Core Library > Grooves and User Library > Grooves)
+
+    Parameters:
+    - uri: Browser URI of a .agr groove
+    - name: Groove name, with or without .agr
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("load_groove", {"uri": uri, "name": name})
+        if isinstance(result, str):
+            return result
+        return (f"Groove '{result['name']}' is pool index {result['groove_index']}"
+                + (" (loaded)" if result["loaded"] else " (already in pool)"))
+    except Exception as e:
+        logger.error(f"Error loading groove: {str(e)}")
+        return f"Error loading groove: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("assign_groove")
+@trajectory_tool("assign_groove")
+def assign_groove(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    groove_index: Optional[int] = None,
+    remove: bool = False,
+    user_prompt: str = ""
+) -> str:
+    """
+    Assign a Groove Pool groove to a Session clip (the groove's timing,
+    velocity and randomness then apply on playback, scaled by the global
+    groove amount), or remove the clip's groove with remove=true. Give
+    exactly one of groove_index or remove.
+
+    Parameters:
+    - track_index: Track holding the clip
+    - clip_index: Session slot index
+    - groove_index: Index from get_groove_pool / load_groove
+    - remove: true to clear the clip's groove
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("assign_groove", {
+            "track_index": track_index, "clip_index": clip_index,
+            "groove_index": groove_index, "remove": remove})
+        if isinstance(result, str):
+            return result
+        return f"Clip '{result['clip_name']}' groove: {result['groove'] or 'none'}"
+    except Exception as e:
+        logger.error(f"Error assigning groove: {str(e)}")
+        return f"Error assigning groove: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_groove_amount")
+@trajectory_tool("set_groove_amount")
+def set_groove_amount(ctx: Context, amount: float, user_prompt: str = "") -> str:
+    """
+    Set the global groove amount, which scales every groove in the Set:
+    0.0 = off, 1.0 = 100% (default), up to 1.3 = 130%.
+
+    Parameters:
+    - amount: 0.0 to 1.3
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("set_groove_amount", {"amount": amount})
+        return result if isinstance(result, str) else f"Global groove amount: {result['global_amount']:g}"
+    except Exception as e:
+        logger.error(f"Error setting groove amount: {str(e)}")
+        return f"Error setting groove amount: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_groove_params")
+@trajectory_tool("set_groove_params")
+def set_groove_params(
+    ctx: Context,
+    groove_index: int,
+    timing: Optional[float] = None,
+    random: Optional[float] = None,
+    velocity: Optional[float] = None,
+    quantize: Optional[float] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Adjust one groove in the pool. Values use the same units get_groove_pool
+    reports; omitted ones are left as they are.
+
+    Parameters:
+    - groove_index: Index from get_groove_pool
+    - timing: How strongly the groove moves note timing
+    - random: Random timing amount
+    - velocity: How strongly the groove changes velocity
+    - quantize: How much notes are quantized before the groove applies
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _gated_call("set_groove_params", {
+            "groove_index": groove_index, "timing": timing, "random": random,
+            "velocity": velocity, "quantize": quantize})
+        return result if isinstance(result, str) else json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting groove params: {str(e)}")
+        return f"Error setting groove params: {str(e)}"
 
 
 # ── Dataset / preference tools (Supabase trajectory recording) ─────────────────
@@ -2016,7 +2486,7 @@ def create_return_track(ctx: Context, user_prompt: str = "") -> str:
 
 # ── Clip automation tools ─────────────────────────────────────────────────────
 
-def _automation_call(command: str, params: Dict[str, Any]) -> Dict[str, Any] | str:
+def _gated_call(command: str, params: Dict[str, Any]) -> Dict[str, Any] | str:
     from .script_handshake import require_capability
 
     ableton = get_ableton_connection()
@@ -2062,7 +2532,7 @@ def get_clip_automation(
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        result = _automation_call("get_clip_automation", {
+        result = _gated_call("get_clip_automation", {
             "track_index": track_index, "clip_index": clip_index,
             "target": target, "times": times, "view": view})
         return result if isinstance(result, str) else json.dumps(result, indent=2)
@@ -2130,7 +2600,7 @@ def write_clip_automation(
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        result = _automation_call("write_clip_automation", {
+        result = _gated_call("write_clip_automation", {
             "track_index": track_index, "clip_index": clip_index, "target": target,
             "points": points, "curve": curve, "resolution": resolution,
             "clear_existing": clear_existing, "view": view})
@@ -2181,7 +2651,7 @@ def clear_clip_automation(
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        result = _automation_call("clear_clip_automation", {
+        result = _gated_call("clear_clip_automation", {
             "track_index": track_index, "clip_index": clip_index, "target": target,
             "all_parameters": all_parameters, "view": view})
         if isinstance(result, str):

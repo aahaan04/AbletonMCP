@@ -65,7 +65,6 @@ SCRIPT_CAPABILITIES = [
     "duplicate_session_clip_to_arrangement",
     "map_rack_magnitude",
     "inspect_rack",
-    "create_locator",
     "get_browser_item",
     "get_browser_categories",
     "get_browser_items",
@@ -94,6 +93,20 @@ SCRIPT_CAPABILITIES = [
     "get_clip_automation",
     "write_clip_automation",
     "clear_clip_automation",
+    "fill_arrangement",
+    "fill_arrangement_section",
+    "set_arrangement_loop",
+    "get_arrangement_layout",
+    "get_locators",
+    "toggle_cue_at_playhead",
+    "rename_locator",
+    "modify_notes",
+    "delete_notes",
+    "get_groove_pool",
+    "load_groove",
+    "assign_groove",
+    "set_groove_amount",
+    "set_groove_params",
 ]
 
 # New parameters on existing commands. Older scripts silently ignore unknown
@@ -614,10 +627,52 @@ class AbletonMCP(ControlSurface):
                 track_index = params.get("track_index", 0)
                 device_index = params.get("device_index", 0)
                 response["result"] = self._inspect_rack(track_index, device_index)
-            elif command_type == "create_locator":
-                name = params.get("name", "")
-                time_val = params.get("time", 0.0)
-                response["result"] = self._create_locator(name, time_val)
+            # ── Arrangement building ───────────────────────────────────
+            elif command_type == "fill_arrangement":
+                response["result"] = self._fill_arrangement(
+                    params.get("track_index", 0), params.get("clip_index", 0),
+                    params.get("start_bar"), params.get("end_bar"),
+                    replace=params.get("replace", False))
+            elif command_type == "fill_arrangement_section":
+                response["result"] = self._fill_arrangement_section(
+                    params.get("start_bar"), params.get("end_bar"),
+                    params.get("placements") or [], replace=params.get("replace", False))
+            elif command_type == "set_arrangement_loop":
+                response["result"] = self._set_arrangement_loop(
+                    params.get("start_bar"), params.get("end_bar"), params.get("enabled", True))
+            elif command_type == "get_arrangement_layout":
+                response["result"] = self._get_arrangement_layout(params.get("track_indexes"))
+            elif command_type == "get_locators":
+                response["result"] = self._get_locators()
+            elif command_type == "toggle_cue_at_playhead":
+                response["result"] = self._toggle_cue_at_playhead()
+            elif command_type == "rename_locator":
+                response["result"] = self._rename_locator(params.get("time"), params.get("name", ""))
+            # ── Note editing ───────────────────────────────────────────
+            elif command_type == "modify_notes":
+                response["result"] = self._modify_notes(
+                    params.get("track_index", 0), params.get("clip_index", 0),
+                    params.get("selection"), params.get("changes"),
+                    view=params.get("view", "session"))
+            elif command_type == "delete_notes":
+                response["result"] = self._delete_notes(
+                    params.get("track_index", 0), params.get("clip_index", 0),
+                    params.get("selection"), view=params.get("view", "session"))
+            # ── Groove pool ────────────────────────────────────────────
+            elif command_type == "get_groove_pool":
+                response["result"] = self._get_groove_pool()
+            elif command_type == "load_groove":
+                response["result"] = self._load_groove(params.get("uri"), params.get("name"))
+            elif command_type == "assign_groove":
+                response["result"] = self._assign_groove(
+                    params.get("track_index", 0), params.get("clip_index", 0),
+                    params.get("groove_index"), params.get("remove", False))
+            elif command_type == "set_groove_amount":
+                response["result"] = self._set_groove_amount(params.get("amount"))
+            elif command_type == "set_groove_params":
+                response["result"] = self._set_groove_params(
+                    params.get("groove_index", 0), params.get("timing"), params.get("random"),
+                    params.get("velocity"), params.get("quantize"))
             # ── Mixer commands ─────────────────────────────────────────
             elif command_type == "set_track_volume":
                 response["result"] = self._set_track_volume(
@@ -805,7 +860,8 @@ class AbletonMCP(ControlSurface):
                         "name": clip.name,
                         "length": clip.length,
                         "is_playing": clip.is_playing,
-                        "is_recording": clip.is_recording
+                        "is_recording": clip.is_recording,
+                        "groove": self._safe_attr(self._safe_attr(clip, "groove"), "name", str, None),
                     }
                 
                 clip_slots.append({
@@ -1648,60 +1704,6 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error duplicating clip to arrangement: " + str(e))
             raise
 
-    def _create_locator(self, name, time_val):
-        """Create (or rename) a named locator at the given beat position.
-
-        Uses Live's Song.set_or_delete_cue(), which toggles a cue at the
-        current_song_time. We temporarily move the playhead, toggle, then
-        restore. If a cue already exists at that time we just rename it
-        instead of toggling (which would delete it).
-        """
-        try:
-            song = self._song
-            target_time = float(time_val)
-            tolerance = 1e-3
-
-            # See if a cue already exists at (or near) the target time
-            existing = None
-            for cue in song.cue_points:
-                if abs(cue.time - target_time) < tolerance:
-                    existing = cue
-                    break
-
-            original_time = song.current_song_time
-
-            if existing is None:
-                # Move playhead, toggle to create, then locate the new cue
-                song.current_song_time = target_time
-                song.set_or_delete_cue()
-                for cue in song.cue_points:
-                    if abs(cue.time - target_time) < tolerance:
-                        existing = cue
-                        break
-                # Restore playhead
-                try:
-                    song.current_song_time = original_time
-                except Exception:
-                    pass
-
-            if existing is None:
-                raise Exception("Failed to create cue at time " + str(target_time))
-
-            if name:
-                try:
-                    existing.name = str(name)
-                except Exception as e:
-                    self.log_message("Could not rename locator: " + str(e))
-
-            return {
-                "success": True,
-                "time": existing.time,
-                "name": existing.name,
-            }
-        except Exception as e:
-            self.log_message("Error creating locator: " + str(e))
-            raise
-
     # ── Browser implementations ───────────────────────────────────────────────
 
     def _get_browser_item(self, uri, path):
@@ -2475,6 +2477,391 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error clearing clip automation: " + str(e))
             raise
+
+    # ── Arrangement building ────────────────────────────────────────────────────
+    # Tools speak in bars the way Live's ruler does: bar 1 starts at beat 0,
+    # and a bar range is inclusive (bars 17-32 = 16 bars). Beats per bar come
+    # from the song's time signature (4/4 -> 4, 6/8 -> 3).
+
+    _EPS = 1e-6
+
+    def _beats_per_bar(self):
+        return float(self._song.signature_numerator) * 4.0 / float(self._song.signature_denominator)
+
+    def _bar_range(self, start_bar, end_bar):
+        """(start_beat, end_beat) for an inclusive 1-based bar range."""
+        start_bar, end_bar = float(start_bar), float(end_bar)
+        if start_bar < 1:
+            raise ValueError("Bars start at 1, got start_bar=%s" % start_bar)
+        if end_bar < start_bar:
+            raise ValueError("end_bar %s is before start_bar %s" % (end_bar, start_bar))
+        bpb = self._beats_per_bar()
+        return (start_bar - 1.0) * bpb, end_bar * bpb
+
+    def _bar_of(self, beat):
+        return float(beat) / self._beats_per_bar() + 1.0
+
+    def _plan_fill(self, track_index, clip_index, start_bar, end_bar, replace):
+        """Validate one fill without touching the set."""
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index %s out of range" % track_index)
+        track = self._song.tracks[track_index]
+        if clip_index < 0 or clip_index >= len(track.clip_slots):
+            raise IndexError("Clip slot %s out of range on track '%s'" % (clip_index, track.name))
+        slot = track.clip_slots[clip_index]
+        if not slot.has_clip:
+            raise ValueError("No clip in slot %d of track '%s'" % (clip_index, track.name))
+        clip = slot.clip
+        start, end = self._bar_range(start_bar, end_bar)
+        length = float(clip.length)
+        repeats = (end - start) / length
+        if abs(repeats - round(repeats)) > 1e-4 or round(repeats) < 1:
+            raise ValueError(
+                "Track '%s': bars %s-%s are %g beats but clip '%s' is %g beats long, "
+                "which is not a whole number of repeats" % (
+                    track.name, start_bar, end_bar, end - start, clip.name, length))
+        in_the_way = [c for c in track.arrangement_clips
+                      if c.start_time < end - self._EPS and c.end_time > start + self._EPS]
+        if in_the_way and not replace:
+            raise ValueError("Track '%s' already has clips in bars %s-%s: %s; pass replace=true "
+                             "to remove clips that lie entirely inside the range" % (
+                                 track.name, start_bar, end_bar,
+                                 ", ".join("'%s' bars %g-%g" % (c.name, self._bar_of(c.start_time),
+                                                                self._bar_of(c.end_time) - 1)
+                                           for c in in_the_way)))
+        partial = [c for c in in_the_way
+                   if c.start_time < start - self._EPS or c.end_time > end + self._EPS]
+        if partial:
+            raise ValueError("Track '%s': clip(s) %s stick out of bars %s-%s, so replacing would "
+                             "delete material outside the range; refusing" % (
+                                 track.name, ", ".join("'%s'" % c.name for c in partial),
+                                 start_bar, end_bar))
+        return {"track": track, "clip": clip, "start": start, "length": length,
+                "repeats": int(round(repeats)), "remove": in_the_way}
+
+    def _do_fill(self, plan):
+        track, clip = plan["track"], plan["clip"]
+        for old in plan["remove"]:
+            track.delete_clip(old)
+        positions = []
+        for i in range(plan["repeats"]):
+            t = plan["start"] + i * plan["length"]
+            track.duplicate_clip_to_arrangement(clip, t)
+            positions.append(t)
+        return {"track_name": track.name, "clip_name": clip.name, "copies": len(positions),
+                "start_bars": [self._bar_of(t) for t in positions],
+                "replaced": len(plan["remove"])}
+
+    def _fill_arrangement(self, track_index, clip_index, start_bar, end_bar, replace=False):
+        try:
+            return self._do_fill(self._plan_fill(track_index, clip_index, start_bar, end_bar, replace))
+        except Exception as e:
+            self.log_message("Error filling arrangement: " + str(e))
+            raise
+
+    def _fill_arrangement_section(self, start_bar, end_bar, placements, replace=False):
+        """Place several Session clips over one bar range. Every placement is
+        validated before any is made, so a bad entry changes nothing."""
+        try:
+            if not placements:
+                raise ValueError("placements is empty")
+            tracks = [p.get("track_index") for p in placements]
+            if len(set(tracks)) != len(tracks):
+                raise ValueError("Each track may appear once per section, got tracks %s" % tracks)
+            plans = [self._plan_fill(p.get("track_index"), p.get("clip_index"),
+                                     start_bar, end_bar, replace) for p in placements]
+            return {"start_bar": start_bar, "end_bar": end_bar,
+                    "placed": [self._do_fill(plan) for plan in plans]}
+        except Exception as e:
+            self.log_message("Error filling arrangement section: " + str(e))
+            raise
+
+    def _set_arrangement_loop(self, start_bar, end_bar, enabled=True):
+        try:
+            start, end = self._bar_range(start_bar, end_bar)
+            self._song.loop_start = start
+            self._song.loop_length = end - start
+            self._song.loop = bool(enabled)
+            return {"loop": bool(self._song.loop),
+                    "start_bar": self._bar_of(self._song.loop_start),
+                    "end_bar": self._bar_of(self._song.loop_start + self._song.loop_length) - 1,
+                    "loop_start": float(self._song.loop_start),
+                    "loop_length": float(self._song.loop_length)}
+        except Exception as e:
+            self.log_message("Error setting arrangement loop: " + str(e))
+            raise
+
+    def _get_locators(self):
+        return {"beats_per_bar": self._beats_per_bar(),
+                "locators": [{"index": i, "name": str(c.name), "time": float(c.time),
+                              "bar": self._bar_of(c.time)}
+                             for i, c in enumerate(self._song.cue_points)]}
+
+    def _get_arrangement_layout(self, track_indexes=None):
+        """Per-track arrangement clips in bars, with gaps and overlaps."""
+        try:
+            song = self._song
+            indexes = range(len(song.tracks)) if track_indexes is None else track_indexes
+            tracks = []
+            for ti in indexes:
+                if ti < 0 or ti >= len(song.tracks):
+                    raise IndexError("Track index %s out of range" % ti)
+                track = song.tracks[ti]
+                clips = sorted(track.arrangement_clips, key=lambda c: c.start_time)
+                entries, gaps, overlaps = [], [], []
+                for i, c in enumerate(clips):
+                    entries.append({"index": i, "name": c.name,
+                                    "start_bar": self._bar_of(c.start_time),
+                                    "end_bar": self._bar_of(c.end_time) - 1,
+                                    "start_time": float(c.start_time), "end_time": float(c.end_time)})
+                for a, b in zip(clips, clips[1:]):
+                    if b.start_time > a.end_time + self._EPS:
+                        gaps.append({"from_bar": self._bar_of(a.end_time),
+                                     "to_bar": self._bar_of(b.start_time) - 1})
+                    elif b.start_time < a.end_time - self._EPS:
+                        overlaps.append({"clips": [a.name, b.name],
+                                         "from_bar": self._bar_of(b.start_time),
+                                         "to_bar": self._bar_of(min(a.end_time, b.end_time)) - 1})
+                tracks.append({"index": ti, "name": track.name, "clips": entries,
+                               "gaps": gaps, "overlaps": overlaps})
+            return {"signature": "%d/%d" % (song.signature_numerator, song.signature_denominator),
+                    "beats_per_bar": self._beats_per_bar(),
+                    "loop": {"enabled": bool(song.loop), "start_bar": self._bar_of(song.loop_start),
+                             "end_bar": self._bar_of(song.loop_start + song.loop_length) - 1},
+                    "locators": self._get_locators()["locators"],
+                    "tracks": tracks}
+        except Exception as e:
+            self.log_message("Error reading arrangement layout: " + str(e))
+            raise
+
+    # Locators: Song.set_or_delete_cue() toggles a cue at the playhead, and
+    # Live applies a playhead move only after the current callback returns.
+    # So the server sequences these primitives as separate commands:
+    # set_current_song_time -> toggle_cue_at_playhead -> rename_locator.
+
+    def _toggle_cue_at_playhead(self):
+        if self._safe_song_property("is_playing", bool, False):
+            raise ValueError("Stop playback first: Live would place the locator at the moving playhead")
+        self._song.set_or_delete_cue()
+        return {"playhead": float(self._song.current_song_time)}
+
+    def _rename_locator(self, time_val, name):
+        cue = next((c for c in self._song.cue_points if abs(c.time - float(time_val)) < 0.01), None)
+        if cue is None:
+            raise ValueError("No locator at beat %s" % time_val)
+        cue.name = str(name)
+        return {"name": str(cue.name), "time": float(cue.time), "bar": self._bar_of(cue.time)}
+
+    # ── In-place note editing ───────────────────────────────────────────────────
+
+    def _midi_clip(self, track_index, clip_index, view="session"):
+        track, clip = self._automation_clip(track_index, clip_index, view)
+        if not getattr(clip, "is_midi_clip", False):
+            raise ValueError("Clip '%s' is not a MIDI clip" % clip.name)
+        return track, clip
+
+    def _select_notes(self, clip, selection):
+        """Notes matching selection: {"note_ids": [...]} or a range of any of
+        pitch_min/pitch_max (inclusive) and time_min/time_max (beats, start
+        time in [time_min, time_max)). Exactly one of the two forms."""
+        if not isinstance(selection, dict) or not selection:
+            raise ValueError("selection is required: note_ids, or a pitch/time range")
+        notes = list(clip.get_notes_extended(0, 128, 0.0, 1e6))
+        ids = selection.get("note_ids")
+        range_keys = [k for k in ("pitch_min", "pitch_max", "time_min", "time_max") if k in selection]
+        if (ids is None) == (not range_keys):
+            raise ValueError("Give either note_ids or a pitch/time range, not both or neither")
+        if ids is not None:
+            wanted = set(int(i) for i in ids)
+            picked = [n for n in notes if n.note_id in wanted]
+            missing = wanted - set(n.note_id for n in picked)
+            if missing:
+                raise ValueError("No notes with id(s) %s in clip '%s'" % (sorted(missing), clip.name))
+            return notes, picked
+        lo_p, hi_p = int(selection.get("pitch_min", 0)), int(selection.get("pitch_max", 127))
+        lo_t = float(selection.get("time_min", -1e6))
+        hi_t = float(selection.get("time_max", 1e6))
+        return notes, [n for n in notes if lo_p <= n.pitch <= hi_p and lo_t <= n.start_time < hi_t]
+
+    def _note_dict(self, n):
+        return {"note_id": int(n.note_id), "pitch": int(n.pitch), "start_time": float(n.start_time),
+                "duration": float(n.duration), "velocity": float(n.velocity), "mute": bool(n.mute)}
+
+    def _modify_notes(self, track_index, clip_index, selection, changes, view="session"):
+        try:
+            _, clip = self._midi_clip(track_index, clip_index, view)
+            if not changes:
+                raise ValueError("changes is empty")
+            for a, b in (("pitch", "transpose"), ("velocity", "velocity_delta"), ("start_time", "shift")):
+                if a in changes and b in changes:
+                    raise ValueError("Give %s or %s, not both" % (a, b))
+            unknown = set(changes) - {"pitch", "transpose", "velocity", "velocity_delta",
+                                      "start_time", "shift", "duration", "mute"}
+            if unknown:
+                raise ValueError("Unknown change(s): %s" % ", ".join(sorted(unknown)))
+            all_notes, picked = self._select_notes(clip, selection)
+            if not picked:
+                raise ValueError("Selection matched no notes in clip '%s'" % clip.name)
+
+            # Compute and validate every result before touching any note.
+            planned = []
+            for n in picked:
+                p = int(changes["pitch"]) if "pitch" in changes else n.pitch + int(changes.get("transpose", 0))
+                v = float(changes["velocity"]) if "velocity" in changes \
+                    else n.velocity + float(changes.get("velocity_delta", 0))
+                s = float(changes["start_time"]) if "start_time" in changes \
+                    else n.start_time + float(changes.get("shift", 0.0))
+                d = float(changes.get("duration", n.duration))
+                m = bool(changes.get("mute", n.mute))
+                if not 0 <= p <= 127:
+                    raise ValueError("Note %d would get pitch %d (0-127)" % (n.note_id, p))
+                if not 1 <= v <= 127:
+                    raise ValueError("Note %d would get velocity %g (1-127)" % (n.note_id, v))
+                if s < 0:
+                    raise ValueError("Note %d would start at beat %g, before the clip" % (n.note_id, s))
+                if d <= 0:
+                    raise ValueError("Note %d would get duration %g" % (n.note_id, d))
+                planned.append((n, p, v, s, d, m))
+            for n, p, v, s, d, m in planned:
+                n.pitch, n.velocity, n.start_time, n.duration, n.mute = p, v, s, d, m
+            clip.apply_note_modifications(all_notes)
+            ids = set(n.note_id for n in picked)
+            after = [self._note_dict(n) for n in clip.get_notes_extended(0, 128, 0.0, 1e6)
+                     if n.note_id in ids]
+            return {"clip_name": clip.name, "modified": len(picked), "notes": after}
+        except Exception as e:
+            self.log_message("Error modifying notes: " + str(e))
+            raise
+
+    def _delete_notes(self, track_index, clip_index, selection, view="session"):
+        try:
+            _, clip = self._midi_clip(track_index, clip_index, view)
+            _, picked = self._select_notes(clip, selection)
+            if not picked:
+                raise ValueError("Selection matched no notes in clip '%s'" % clip.name)
+            deleted = [self._note_dict(n) for n in picked]
+            clip.remove_notes_by_id([n.note_id for n in picked])
+            return {"clip_name": clip.name, "deleted": len(deleted), "notes": deleted,
+                    "remaining": len(clip.get_notes_extended(0, 128, 0.0, 1e6))}
+        except Exception as e:
+            self.log_message("Error deleting notes: " + str(e))
+            raise
+
+    # ── Groove pool ─────────────────────────────────────────────────────────────
+
+    def _grooves(self):
+        pool = getattr(self._song, "groove_pool", None)
+        if pool is None:
+            raise Exception("This Live version doesn't expose the groove pool (needs Live 11+)")
+        return list(pool.grooves)
+
+    def _groove_info(self, index, g):
+        return {"index": index, "name": str(g.name),
+                "timing": float(g.timing_amount), "random": float(g.random_amount),
+                "velocity": float(g.velocity_amount), "quantize": float(g.quantization_amount)}
+
+    def _get_groove_pool(self):
+        return {"global_amount": float(self._song.groove_amount),
+                "grooves": [self._groove_info(i, g) for i, g in enumerate(self._grooves())]}
+
+    def _find_groove_item(self, name):
+        """A .agr item by name (with or without .agr) under Core Library >
+        Grooves or User Library > Grooves, searched a few folders deep."""
+        wanted = str(name).strip().lower()
+        if not wanted.endswith(".agr"):
+            wanted += ".agr"
+        browser = self.application().browser
+        parents = []
+        packs = getattr(browser, "packs", None)
+        if packs is not None:
+            parents += [p for p in packs.children if str(p.name).lower() == "core library"]
+        user = getattr(browser, "user_library", None)
+        if user is not None:
+            parents.append(user)
+        roots = [c for parent in parents for c in parent.children if str(c.name).lower() == "grooves"]
+
+        def walk(item, depth):
+            for child in item.children:
+                if str(child.name).strip().lower() == wanted:
+                    return child
+            if depth < 4:
+                for child in item.children:
+                    if getattr(child, "is_folder", False):
+                        hit = walk(child, depth + 1)
+                        if hit is not None:
+                            return hit
+            return None
+
+        for root in roots:
+            hit = walk(root, 0)
+            if hit is not None:
+                return hit
+        return None
+
+    def _load_groove(self, uri=None, name=None):
+        """Add a groove from Live's browser to the Groove Pool. Reuses one
+        already in the pool with the same name."""
+        try:
+            if (uri is None) == (name is None):
+                raise ValueError("Give exactly one of uri or name")
+            item = (self._find_browser_item_by_uri(self.application().browser, uri) if uri
+                    else self._find_groove_item(name))
+            if item is None:
+                raise ValueError("Groove %s not found in the browser" % (uri or name))
+            label = str(item.name)[:-4] if str(item.name).lower().endswith(".agr") else str(item.name)
+            grooves = self._grooves()
+            existing = next((i for i, g in enumerate(grooves) if g.name == label), None)
+            if existing is not None:
+                return {"groove_index": existing, "name": label, "loaded": False,
+                        "pool": [g.name for g in grooves]}
+            before = len(grooves)
+            self.application().browser.load_item(item)
+            grooves = self._grooves()
+            if len(grooves) != before + 1:
+                raise Exception("Loading '%s' did not add a groove to the pool (pool: %s)"
+                                % (item.name, [g.name for g in grooves]))
+            return {"groove_index": before, "name": grooves[before].name, "loaded": True,
+                    "pool": [g.name for g in grooves]}
+        except Exception as e:
+            self.log_message("Error loading groove: " + str(e))
+            raise
+
+    def _assign_groove(self, track_index, clip_index, groove_index=None, remove=False):
+        try:
+            if (groove_index is None) == (not remove):
+                raise ValueError("Give either groove_index or remove=true")
+            _, clip = self._automation_clip(track_index, clip_index, "session")
+            if remove:
+                clip.groove = None
+            else:
+                grooves = self._grooves()
+                if groove_index < 0 or groove_index >= len(grooves):
+                    raise IndexError("groove_index %s out of range (pool has %d)" % (groove_index, len(grooves)))
+                clip.groove = grooves[groove_index]
+            g = clip.groove
+            return {"clip_name": clip.name, "groove": str(g.name) if g is not None else None}
+        except Exception as e:
+            self.log_message("Error assigning groove: " + str(e))
+            raise
+
+    def _set_groove_amount(self, amount):
+        amount = float(amount)
+        if not 0.0 <= amount <= 1.3:
+            raise ValueError("Global groove amount is 0..1.3 (0-130%%), got %s" % amount)
+        self._song.groove_amount = amount
+        return {"global_amount": float(self._song.groove_amount)}
+
+    def _set_groove_params(self, groove_index, timing=None, random=None, velocity=None, quantize=None):
+        grooves = self._grooves()
+        if groove_index < 0 or groove_index >= len(grooves):
+            raise IndexError("groove_index %s out of range (pool has %d)" % (groove_index, len(grooves)))
+        g = grooves[groove_index]
+        # Same units get_groove_pool reports; Live rejects out-of-range values itself.
+        for value, attr in ((timing, "timing_amount"), (random, "random_amount"),
+                            (velocity, "velocity_amount"), (quantize, "quantization_amount")):
+            if value is not None:
+                setattr(g, attr, float(value))
+        return self._groove_info(groove_index, g)
 
     # ── Passive human-UI listeners ──────────────────────────────────────────────
 

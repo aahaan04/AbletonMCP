@@ -47,6 +47,17 @@ MODIFYING_TOOLS = {
     "create_return_track",
     "write_clip_automation",
     "clear_clip_automation",
+    "fill_arrangement",
+    "fill_arrangement_section",
+    "set_arrangement_loop",
+    "set_locator",
+    "delete_locator",
+    "modify_notes",
+    "delete_notes",
+    "load_groove",
+    "assign_groove",
+    "set_groove_amount",
+    "set_groove_params",
 }
 
 _PARAM_KEYS = (

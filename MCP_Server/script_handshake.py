@@ -45,7 +45,8 @@ def script_has_capability(name: str) -> bool:
         return name in _LEGACY_CAPABILITIES
     caps = info.get("capabilities")
     if isinstance(caps, list):
-        return name in caps
+        # features: new params on existing commands (e.g. delete_clip's view)
+        return name in caps or name in (info.get("features") or [])
     return script_version_ok()
 
 

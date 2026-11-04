@@ -101,6 +101,15 @@ def test_capability_absent_from_live_script_is_still_refused():
     assert "loaded='1.6.0'" in out
 
 
+def test_features_count_as_capabilities():
+    """New params on existing commands are advertised as features, not
+    commands, and gate the same way."""
+    conn = FakeConnection(info=dict(CURRENT_INFO, features=["delete_arrangement_clip"]))
+    assert sh.require_capability("delete_arrangement_clip", conn.send_command) is None
+    assert "missing capability 'load_on_return_or_master'" in \
+        sh.require_capability("load_on_return_or_master", conn.send_command)
+
+
 def test_legacy_script_is_still_refused():
     conn = FakeConnection(info=None)
     out = sh.require_capability("clear_notes_from_clip", conn.send_command)

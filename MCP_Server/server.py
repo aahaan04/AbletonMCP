@@ -611,7 +611,10 @@ def set_device_parameter(
 
     Give exactly one of parameter_name (case-insensitive exact match) or
     parameter_index; read get_device_parameters first for names, indices and
-    min..max ranges. value is in the parameter's own units.
+    min..max ranges. value is in the parameter's own units, which are often
+    not what Live displays: many parameters (e.g. Reverb's Decay Time) run
+    0..1 internally while showing seconds or Hz. Check min/max and the
+    value_string, and read back after setting. Out-of-range values are refused.
 
     Parameters:
     - track_index: Track (or return) index; ignored for the master

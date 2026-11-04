@@ -3351,8 +3351,13 @@ class AbletonMCP(ControlSurface):
                             "is_enabled": bool(getattr(param, "is_enabled", True)),
                             "is_quantized": bool(getattr(param, "is_quantized", False)),
                         }
-                        if hasattr(param, "value_string"):
-                            entry["value_string"] = str(param.value_string)
+                        # What Live displays ("2.40 s", "-6.0 dB"): many params
+                        # store 0..1 internally, so this is the readable value.
+                        try:
+                            entry["value_string"] = str(param.str_for_value(param.value))
+                        except Exception:
+                            if hasattr(param, "value_string"):
+                                entry["value_string"] = str(param.value_string)
                         if hasattr(param, "automation_state"):
                             try:
                                 entry["automation_state"] = int(param.automation_state)

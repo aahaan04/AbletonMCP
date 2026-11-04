@@ -959,12 +959,14 @@ def cmd_selftest_devparams(client: Client, via_server: bool) -> int:
             client.send("load_browser_item", {"track_index": returns, "item_uri": browser_uri(client, "audio_effects", "Reverb"),
                                               "track_type": "return"})
             name = snapshot(client)["return_tracks"][returns]["name"]
-            ops.run("set_device_parameter", track_index=returns, device_index=0, value=8.0,
+            # Reverb's Decay Time is stored 0..1; only its display is in seconds.
+            ops.run("set_device_parameter", track_index=returns, device_index=0, value=0.6,
                     parameter_name="Decay Time", track_type="return")
             decay = next(q for q in ops.run("get_device_parameters", track_index=returns, device_index=0,
                                             track_type="return", **({"name_filter": "decay"} if via_server else {}))
                          ["device"]["parameters"] if q["name"].strip() == "Decay Time")
-            c.check("return Reverb Decay Time", _close(decay["value"], 8.0, 1e-3), decay.get("value_string", ""))
+            c.check("return Reverb Decay Time", _close(decay["value"], 0.6, 1e-3),
+                    f"0.6 shows as {decay.get('value_string', '?')}")
             try:
                 ops.run("set_device_parameter", track_index=0, device_index=master_n, value=99.0,
                         parameter_name="Ceiling", track_type="master")

@@ -491,16 +491,22 @@ def get_clip_notes(
     ctx: Context,
     track_index: int,
     clip_index: int,
+    compact: bool = False,
     user_prompt: str = "",
 ) -> str:
     """
     Read all MIDI notes from a Session-view clip.
 
-    Returns pitch, start_time, duration, velocity, mute (and extended fields when available).
+    Default: one object per note with note_id, pitch, start_time, duration,
+    velocity, mute (use the note_id values with modify_notes/delete_notes).
+    compact=true returns [pitch, start, duration, velocity] rows (plus true
+    when muted) sorted by time, about a fifth of the size: use it to check
+    or compare clips.
 
     Parameters:
     - track_index: Track that owns the clip
     - clip_index: Session clip slot index
+    - compact: Return compact rows instead of note objects
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
@@ -514,6 +520,14 @@ def get_clip_notes(
             "get_clip_notes",
             {"track_index": track_index, "clip_index": clip_index},
         )
+        if compact:
+            from .note_tools import compact as to_rows
+
+            result = {"clip_name": result.get("clip_name"), "length": result.get("length"),
+                      "note_count": result.get("note_count"),
+                      "format": "[pitch, start, duration, velocity(, muted)]",
+                      "notes": to_rows(result.get("notes", []))}
+            return json.dumps(result, separators=(",", ":"))
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting clip notes: {str(e)}")
@@ -696,27 +710,113 @@ def set_track_name(ctx: Context, track_index: int, name: str, user_prompt: str =
         logger.error(f"Error setting track name: {str(e)}")
         return f"Error setting track name: {str(e)}"
 
+# ── Note writing helpers (compact notes, repeats, drum steps) ──────────────────
+
+NoteInput = Union[List[float], Dict[str, Union[int, float, bool]]]
+
+_ARRANGEMENT_COPY_NOTE = (
+    "Arrangement copies of this clip do not follow Session edits; if it is "
+    "already placed in the song, re-place it with fill_arrangement or "
+    "fill_arrangement_section (replace=true)."
+)
+
+
+def _session_clip_info(ableton, track_index: int, clip_index: int) -> Optional[Dict[str, Any]]:
+    """The clip dict from get_track_info for one slot, or None if it is empty."""
+    slots = ableton.send_command("get_track_info", {"track_index": track_index})["clip_slots"]
+    if clip_index < 0 or clip_index >= len(slots):
+        raise IndexError(f"Clip slot {clip_index} out of range (track has {len(slots)})")
+    return slots[clip_index]["clip"] if slots[clip_index]["has_clip"] else None
+
+
+def _write_notes(ableton, track_index: int, clip_index: int, notes: List[Any],
+                 repeat_every_beats: Optional[float] = None,
+                 repeat_until_beats: Optional[float] = None) -> Dict[str, Any]:
+    """Normalise compact/dict notes, tile them if asked, and add them."""
+    from .note_tools import normalize_notes, tile_notes
+
+    clip = _session_clip_info(ableton, track_index, clip_index)
+    if clip is None:
+        raise ValueError(f"No clip in slot {clip_index} of track {track_index}")
+    length = float(clip["length"])
+    pattern = normalize_notes(notes)
+    written = pattern
+    if repeat_every_beats:
+        written = tile_notes(pattern, float(repeat_every_beats),
+                             float(repeat_until_beats) if repeat_until_beats else length)
+    if written:
+        ableton.send_command("add_notes_to_clip", {
+            "track_index": track_index, "clip_index": clip_index, "notes": written})
+    past_end = sum(1 for n in written if n["start_time"] >= length - 1e-9)
+    return {"pattern": len(pattern), "written": len(written), "length": length,
+            "past_end": past_end, "clip": clip}
+
+
+def _notes_summary(info: Dict[str, Any]) -> str:
+    text = f"{info['written']} notes"
+    if info["written"] != info["pattern"]:
+        text += f" ({info['pattern']}-note pattern repeated)"
+    if info["past_end"]:
+        text += (f". WARNING: {info['past_end']} note(s) start at or after the clip end "
+                 f"(beat {info['length']:g}) and will not play")
+    return text
+
+
 @mcp.tool()
 @rich_telemetry_tool("create_clip")
 @trajectory_tool("create_clip")
-def create_clip(ctx: Context, track_index: int, clip_index: int, length: float = 4.0, user_prompt: str = "") -> str:
+def create_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    length: float = 4.0,
+    name: Optional[str] = None,
+    notes: Optional[List[NoteInput]] = None,
+    repeat_every_beats: Optional[float] = None,
+    user_prompt: str = ""
+) -> str:
     """
-    Create a new MIDI clip in the specified track and clip slot.
+    Create a MIDI clip in an empty Session slot, and optionally name it and
+    fill it in the same call (preferred over create_clip + set_clip_name +
+    add_notes_to_clip).
+
+    notes use the compact form [pitch, start_beat, duration_beats, velocity]
+    (optionally a 5th value true = muted), e.g. [[60, 0, 1, 100], [63, 1, 1, 90]].
+    With repeat_every_beats, the notes are one pattern (all starting inside
+    the first repeat) tiled across the whole clip: write one bar of a 4-bar
+    clip with repeat_every_beats=4. For drums, write_drum_pattern is shorter.
+
+    The result reports the clip's groove: Live can give new clips a groove
+    from the Set's Groove Pool on its own.
 
     Parameters:
-    - track_index: The index of the track to create the clip in
-    - clip_index: The index of the clip slot to create the clip in
-    - length: The length of the clip in beats (default: 4.0)
+    - track_index: Track to create the clip in
+    - clip_index: Empty clip slot
+    - length: Clip length in beats (4 beats = 1 bar in 4/4)
+    - name: Optional clip name
+    - notes: Optional notes, compact arrays or {"pitch","start_time","duration","velocity"} objects
+    - repeat_every_beats: Optional pattern length to repeat the notes across the clip
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("create_clip", {
-            "track_index": track_index, 
-            "clip_index": clip_index, 
+        ableton.send_command("create_clip", {
+            "track_index": track_index,
+            "clip_index": clip_index,
             "length": length
         })
-        return f"Created new clip at track {track_index}, slot {clip_index} with length {length} beats"
+        parts = [f"Created clip at track {track_index}, slot {clip_index}, {length:g} beats"]
+        if name:
+            ableton.send_command("set_clip_name", {
+                "track_index": track_index, "clip_index": clip_index, "name": name})
+            parts[0] += f", named '{name}'"
+        if notes:
+            info = _write_notes(ableton, track_index, clip_index, notes, repeat_every_beats)
+            parts.append("added " + _notes_summary(info))
+        groove = (_session_clip_info(ableton, track_index, clip_index) or {}).get("groove")
+        if groove:
+            parts.append(f"groove '{groove}' is assigned (from the Set's Groove Pool)")
+        return "; ".join(parts)
     except Exception as e:
         logger.error(f"Error creating clip: {str(e)}")
         return f"Error creating clip: {str(e)}"
@@ -758,32 +858,138 @@ def add_notes_to_clip(
     ctx: Context,
     track_index: int,
     clip_index: int,
-    notes: List[Dict[str, Union[int, float, bool]]],
+    notes: List[NoteInput],
+    repeat_every_beats: Optional[float] = None,
+    repeat_until_beats: Optional[float] = None,
     user_prompt: str = ""
 ) -> str:
     """
-    Add MIDI notes to a clip.
+    Add MIDI notes to an existing Session clip (adds; does not replace).
+
+    Use the compact form for anything beyond a few notes:
+    [pitch, start_beat, duration_beats, velocity] (optionally a 5th value
+    true = muted), e.g. [[36, 0, 0.25, 110], [36, 1, 0.25, 100]]. The object
+    form {"pitch","start_time","duration","velocity","mute"} also works.
+
+    To fill a clip from one bar, write that bar and set repeat_every_beats
+    (e.g. 4): the notes are tiled up to repeat_until_beats, default the clip
+    length. For drums prefer write_drum_pattern; for a new clip prefer
+    create_clip(name=..., notes=...).
 
     On a drum track, call get_drum_pads first and use the pad notes it
-    returns as pitches; never guess which note is which drum.
+    returns as pitches; never guess which note is which drum. Arrangement
+    copies of this clip do not follow Session edits; re-place them with
+    fill_arrangement(_section) replace=true.
 
     Parameters:
     - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot containing the clip
-    - notes: List of note dictionaries, each with pitch, start_time, duration, velocity, and mute
+    - notes: Compact arrays or note objects
+    - repeat_every_beats: Optional pattern length; notes must start inside the first repeat
+    - repeat_until_beats: Where repeating stops (default: clip length)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("add_notes_to_clip", {
-            "track_index": track_index,
-            "clip_index": clip_index,
-            "notes": notes
-        })
-        return f"Added {len(notes)} notes to clip at track {track_index}, slot {clip_index}"
+        info = _write_notes(ableton, track_index, clip_index, notes,
+                            repeat_every_beats, repeat_until_beats)
+        return f"Added {_notes_summary(info)} to clip at track {track_index}, slot {clip_index}"
     except Exception as e:
         logger.error(f"Error adding notes to clip: {str(e)}")
         return f"Error adding notes to clip: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("write_drum_pattern")
+@trajectory_tool("write_drum_pattern")
+def write_drum_pattern(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    pattern: Dict[str, Union[str, Dict[str, Any]]],
+    step_beats: float = 0.25,
+    length: Optional[float] = None,
+    name: Optional[str] = None,
+    replace: bool = True,
+    velocity: int = 100,
+    accent_velocity: int = 127,
+    ghost_velocity: int = 60,
+    gate_beats: Optional[float] = None,
+    device_index: Optional[int] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Write a drum part from step strings, one row per Drum Rack pad. This is
+    the shortest way to write drums; pads are looked up by name through
+    get_drum_pads, so pitches are never guessed.
+
+    pattern maps a pad to its steps, e.g. with 16th-note steps (step_beats=0.25):
+      {"Kick": "x...x...x...x...",
+       "Clap": "....x.......x...",
+       "Hat":  "o.x.o.x.o.x.o.X."}
+    Keys: a pad name (case-insensitive; a unique part like "Hat" is fine),
+    a MIDI note ("36") or a note name ("C1").
+    Steps: x = hit at `velocity`, X = accent, o = ghost, 1-9 = velocity
+    14..127, . - _ = rest; spaces and | are ignored (use "x... x... | ...").
+    For exact velocities use {"steps": "x.x.", "velocities": [120, 0, 80, 0]}.
+
+    Each row repeats to fill the clip, so one bar of steps fills a 4-bar
+    clip; rows may differ in length (polyrhythms). If the slot is empty a
+    clip is created with `length` beats (default: the longest row). By
+    default the clip's existing notes are replaced; pass replace=false to
+    add on top.
+
+    Parameters:
+    - track_index: Track with a Drum Rack
+    - clip_index: Session slot (empty or with a clip)
+    - pattern: Pad -> step string (or {"steps", "velocities"})
+    - step_beats: Beats per step (0.25 = 16ths, 0.5 = 8ths, 1/3 = 8th triplets)
+    - length: Clip length in beats when a clip is created
+    - name: Optional clip name
+    - replace: Clear the clip's notes first (default true)
+    - velocity / accent_velocity / ghost_velocity: Velocities for x / X / o
+    - gate_beats: Note length (default: one step)
+    - device_index: Drum Rack position if the track has more than one
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .note_tools import drum_pattern_notes, parse_steps
+
+        ableton = get_ableton_connection()
+        pads = ableton.send_command("get_drum_pads", {
+            "track_index": track_index, "device_index": device_index})["pads"]
+        clip = _session_clip_info(ableton, track_index, clip_index)
+        created = clip is None
+        if created:
+            longest = max(parse_steps(spec, velocity, accent_velocity, ghost_velocity)[1]
+                          for spec in pattern.values()) * step_beats
+            clip_length = float(length) if length else longest
+            ableton.send_command("create_clip", {
+                "track_index": track_index, "clip_index": clip_index, "length": clip_length})
+        else:
+            clip_length = float(clip["length"])
+            if replace:
+                ableton.send_command("clear_notes_from_clip", {
+                    "track_index": track_index, "clip_index": clip_index})
+        notes, rows = drum_pattern_notes(pattern, pads, step_beats, clip_length,
+                                         velocity, accent_velocity, ghost_velocity, gate_beats)
+        if notes:
+            ableton.send_command("add_notes_to_clip", {
+                "track_index": track_index, "clip_index": clip_index, "notes": notes})
+        if name:
+            ableton.send_command("set_clip_name", {
+                "track_index": track_index, "clip_index": clip_index, "name": name})
+        lines = [f"- {r['row']} -> {r['pitch']} ({r['note_name']}): {r['hits_per_repeat']} hits per "
+                 f"{r['steps']} steps, {r['notes']} notes" for r in rows]
+        head = (f"{'Created' if created else ('Replaced notes in' if replace else 'Added to')} "
+                f"clip at track {track_index}, slot {clip_index} ({clip_length:g} beats"
+                + (f", '{name}'" if name else "") + f"): {len(notes)} notes")
+        groove = (_session_clip_info(ableton, track_index, clip_index) or {}).get("groove")
+        tail = f"\nGroove assigned: '{groove}'" if groove else ""
+        return head + "\n" + "\n".join(lines) + tail
+    except Exception as e:
+        logger.error(f"Error writing drum pattern: {str(e)}")
+        return f"Error writing drum pattern: {str(e)}"
 
 @mcp.tool()
 @rich_telemetry_tool("clear_notes_from_clip")
@@ -1644,6 +1850,8 @@ def modify_notes(
     """
     Edit existing notes in a MIDI clip in place, without clearing it. Note
     IDs are kept. Read the notes first with get_clip_notes.
+    Arrangement copies of the clip do not follow these edits; re-place them
+    with fill_arrangement(_section) replace=true.
 
     selection picks notes in exactly one of two ways:
     - {"note_ids": [3, 7]}: the note_id values returned by get_clip_notes
@@ -1692,6 +1900,8 @@ def delete_notes(
     """
     Delete specific notes from a MIDI clip. To empty the whole clip use
     clear_notes_from_clip instead; an empty selection is refused.
+    Arrangement copies of the clip do not follow these edits; re-place them
+    with fill_arrangement(_section) replace=true.
 
     selection picks notes in exactly one of two ways:
     - {"note_ids": [3, 7]}: the note_id values returned by get_clip_notes

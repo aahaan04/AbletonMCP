@@ -82,6 +82,8 @@ def _extract_tool_params(kwargs: dict, capture_notes: bool = False) -> dict:
                         duration = n.get('duration', 0)
                         velocity = n.get('velocity', 100)
                         compact_notes.append([pitch, start, duration, velocity])
+                    elif isinstance(n, (list, tuple)) and len(n) >= 4:
+                        compact_notes.append(list(n[:4]))
 
                 params['notes'] = compact_notes
 

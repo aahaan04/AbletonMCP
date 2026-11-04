@@ -48,6 +48,11 @@ class FakeConnection:
         self.sent = []  # list of (command_type, params) tuples
 
     def send_command(self, command_type, params=None):
+        if command_type == "get_track_info" and self.raise_exc is None:
+            # Note-writing tools read the clip's length first.
+            return {"clip_slots": [{"index": i, "has_clip": True,
+                                    "clip": {"name": "Clip", "length": 16.0, "groove": None}}
+                                   for i in range(8)]}
         self.sent.append((command_type, params or {}))
         if self.raise_exc is not None:
             raise self.raise_exc
@@ -145,7 +150,9 @@ def test_read_output_feeds_straight_into_add_notes(fake_conn):
     conn.response = {"note_count": len(notes)}
     call(server.add_notes_to_clip, None, 0, 0, notes)
     written = [c for c in conn.sent if c[0] == "add_notes_to_clip"][0][1]["notes"]
-    assert written == SAMPLE_NOTES
+    # note_id is read-only metadata; everything that defines the note survives.
+    keys = ("pitch", "start_time", "duration", "velocity", "mute")
+    assert written == [{k: n[k] for k in keys} for n in SAMPLE_NOTES]
 
 
 def test_add_notes_forwards_track_clip_and_notes(fake_conn):

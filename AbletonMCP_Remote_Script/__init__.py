@@ -63,6 +63,9 @@ SCRIPT_CAPABILITIES = [
     "set_send",
     "set_track_mute",
     "set_track_solo",
+    "get_drum_pads",
+    "get_nested_device_parameters",
+    "set_nested_device_parameter",
 ]
 
 def create_instance(c_instance):
@@ -312,7 +315,9 @@ class AbletonMCP(ControlSurface):
                                  "create_locator",
                                  # Mixer – must run on the main thread
                                  "set_track_volume", "set_track_panning", "set_send",
-                                 "set_track_mute", "set_track_solo"]:
+                                 "set_track_mute", "set_track_solo",
+                                 # Racks
+                                 "set_nested_device_parameter"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -441,6 +446,17 @@ class AbletonMCP(ControlSurface):
                                 params.get("track_index", 0), "solo",
                                 params.get("solo", True),
                                 params.get("track_type", "track"))
+                        elif command_type == "set_nested_device_parameter":
+                            result = self._set_nested_device_parameter(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("value"),
+                                chain_index=params.get("chain_index"),
+                                pad_note=params.get("pad_note"),
+                                nested_device_index=params.get("nested_device_index", 0),
+                                path=params.get("path"),
+                                parameter_index=params.get("parameter_index"),
+                                parameter_name=params.get("parameter_name"))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -508,6 +524,17 @@ class AbletonMCP(ControlSurface):
                     include_notes=include_notes,
                     include_params=include_params,
                 )
+            elif command_type == "get_drum_pads":
+                response["result"] = self._get_drum_pads(
+                    params.get("track_index", 0), params.get("device_index"))
+            elif command_type == "get_nested_device_parameters":
+                response["result"] = self._get_nested_device_parameters(
+                    params.get("track_index", 0),
+                    params.get("device_index", 0),
+                    chain_index=params.get("chain_index"),
+                    pad_note=params.get("pad_note"),
+                    nested_device_index=params.get("nested_device_index", 0),
+                    path=params.get("path"))
             elif command_type == "drain_passive_events":
                 response["result"] = self._drain_passive_events()
             elif command_type == "set_device_parameter":
@@ -1776,6 +1803,204 @@ class AbletonMCP(ControlSurface):
                 return "unknown"
         except:
             return "unknown"
+
+    # ── Racks: drum pads and nested devices ─────────────────────────────────────
+
+    _NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+
+    def _note_name(self, note):
+        """Live's octave numbering: MIDI 36 is C1, 60 is C3."""
+        return "%s%d" % (self._NOTE_NAMES[note % 12], note // 12 - 2)
+
+    def _track_device(self, track_index, device_index):
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if device_index < 0 or device_index >= len(track.devices):
+            raise IndexError("Device index %s out of range (track '%s' has %d devices)"
+                             % (device_index, track.name, len(track.devices)))
+        return track, track.devices[device_index]
+
+    def _summarize_device(self, device, index):
+        return {
+            "index": index,
+            "name": device.name,
+            "class_name": device.class_name,
+            "type": self._get_device_type(device),
+            "is_rack": bool(getattr(device, "can_have_chains", False)),
+        }
+
+    def _rack_chain_index(self, rack, chain, note):
+        """Index of a drum pad's chain in rack.chains (which nested addressing
+        by chain_index uses), matched on the chain's trigger note."""
+        for i, candidate in enumerate(rack.chains):
+            if self._safe_attr(candidate, "in_note", int, None) == note and candidate.name == chain.name:
+                return i
+        return None
+
+    def _get_drum_pads(self, track_index, device_index=None):
+        """List the pads of a Drum Rack that hold something."""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+            if device_index is None:
+                racks = [i for i, d in enumerate(track.devices)
+                         if getattr(d, "can_have_drum_pads", False)]
+                if len(racks) != 1:
+                    raise ValueError(
+                        "Track '%s' has %d top-level Drum Racks; pass device_index"
+                        % (track.name, len(racks)))
+                device_index = racks[0]
+            track, rack = self._track_device(track_index, device_index)
+            if not getattr(rack, "can_have_drum_pads", False):
+                raise ValueError("Device '%s' (index %d) is not a Drum Rack"
+                                 % (rack.name, device_index))
+
+            pads = []
+            for pad in rack.drum_pads:
+                chains = list(pad.chains)
+                if not chains:
+                    continue
+                pads.append({
+                    "note": pad.note,
+                    "note_name": self._note_name(pad.note),
+                    "name": pad.name,
+                    "mute": bool(pad.mute),
+                    "solo": bool(pad.solo),
+                    "chains": [{
+                        "chain_index": self._rack_chain_index(rack, chain, pad.note),
+                        "name": chain.name,
+                        "devices": [self._summarize_device(d, i)
+                                    for i, d in enumerate(chain.devices)],
+                    } for chain in chains],
+                })
+            return {
+                "track_index": track_index,
+                "device_index": device_index,
+                "rack_name": rack.name,
+                "pad_count": len(pads),
+                "pads": pads,
+            }
+        except Exception as e:
+            self.log_message("Error getting drum pads: " + str(e))
+            raise
+
+    def _resolve_nested_device(self, track_index, device_index, chain_index=None,
+                               pad_note=None, nested_device_index=0, path=None):
+        """Find a device inside a rack.
+
+        Exactly one of chain_index (index into rack.chains, any rack type) or
+        pad_note (Drum Racks only) picks the chain; nested_device_index picks
+        the device in it. path continues deeper as [chain, device, ...] pairs,
+        e.g. a drum pad's Instrument Rack -> its Simpler is path=[0, 0].
+        Returns (device, location string).
+        """
+        track, rack = self._track_device(track_index, device_index)
+        if not getattr(rack, "can_have_chains", False):
+            raise ValueError("Device '%s' (index %d) is not a rack" % (rack.name, device_index))
+        if (chain_index is None) == (pad_note is None):
+            raise ValueError("Give exactly one of chain_index or pad_note")
+
+        location = [rack.name]
+        if pad_note is not None:
+            if not getattr(rack, "can_have_drum_pads", False):
+                raise ValueError("pad_note only applies to Drum Racks; '%s' is not one, use chain_index"
+                                 % rack.name)
+            if pad_note < 0 or pad_note > 127:
+                raise IndexError("pad_note must be 0-127")
+            pad = next((p for p in rack.drum_pads if p.note == pad_note), None)
+            chains = list(pad.chains) if pad is not None else []
+            if not chains:
+                raise ValueError("Pad %d (%s) is empty" % (pad_note, self._note_name(pad_note)))
+            if len(chains) > 1:
+                raise ValueError("Pad %d (%s) has %d layered chains; pass chain_index from get_drum_pads"
+                                 % (pad_note, self._note_name(pad_note), len(chains)))
+            chain = chains[0]
+            location.append("%s (%s)" % (pad.name, self._note_name(pad_note)))
+        else:
+            if chain_index < 0 or chain_index >= len(rack.chains):
+                raise IndexError("chain_index %s out of range ('%s' has %d chains)"
+                                 % (chain_index, rack.name, len(rack.chains)))
+            chain = rack.chains[chain_index]
+            location.append("chain %d '%s'" % (chain_index, chain.name))
+
+        steps = [nested_device_index] + list(path or [])
+        if len(steps) % 2 != 1:
+            raise ValueError("path must be [chain_index, device_index] pairs")
+        device = None
+        for i, step in enumerate(steps):
+            if i % 2 == 0:
+                devices = list(chain.devices)
+                if step < 0 or step >= len(devices):
+                    raise IndexError("device index %s out of range ('%s' has %d devices)"
+                                     % (step, chain.name, len(devices)))
+                device = devices[step]
+                location.append(device.name)
+            else:
+                if not getattr(device, "can_have_chains", False):
+                    raise ValueError("'%s' is not a rack, so path cannot go deeper" % device.name)
+                if step < 0 or step >= len(device.chains):
+                    raise IndexError("chain index %s out of range ('%s' has %d chains)"
+                                     % (step, device.name, len(device.chains)))
+                chain = device.chains[step]
+                location.append("chain %d '%s'" % (step, chain.name))
+        return device, " > ".join(location)
+
+    def _get_nested_device_parameters(self, track_index, device_index, chain_index=None,
+                                      pad_note=None, nested_device_index=0, path=None):
+        try:
+            device, location = self._resolve_nested_device(
+                track_index, device_index, chain_index, pad_note, nested_device_index, path)
+            return {
+                "location": location,
+                "device": self._serialize_device(device, nested_device_index, include_params=True, depth=1),
+            }
+        except Exception as e:
+            self.log_message("Error getting nested device parameters: " + str(e))
+            raise
+
+    def _set_nested_device_parameter(self, track_index, device_index, value, chain_index=None,
+                                     pad_note=None, nested_device_index=0, path=None,
+                                     parameter_index=None, parameter_name=None):
+        try:
+            device, location = self._resolve_nested_device(
+                track_index, device_index, chain_index, pad_note, nested_device_index, path)
+            params = list(device.parameters)
+            if (parameter_index is None) == (parameter_name is None):
+                raise ValueError("Give exactly one of parameter_index or parameter_name")
+            if parameter_name is not None:
+                wanted = parameter_name.strip().lower()
+                matches = [i for i, p in enumerate(params) if p.name.strip().lower() == wanted]
+                if len(matches) != 1:
+                    raise ValueError("%d parameters named '%s' on '%s' (have: %s)"
+                                     % (len(matches), parameter_name, device.name,
+                                        ", ".join(p.name.strip() for p in params)))
+                parameter_index = matches[0]
+            if parameter_index < 0 or parameter_index >= len(params):
+                raise IndexError("parameter_index %s out of range ('%s' has %d parameters)"
+                                 % (parameter_index, device.name, len(params)))
+            param = params[parameter_index]
+            value = float(value)
+            if value < param.min or value > param.max:
+                raise ValueError("%s takes %s..%s, got %s" % (param.name.strip(), param.min, param.max, value))
+            if getattr(param, "is_quantized", False):
+                value = float(round(value))
+            old = float(param.value)
+            param.value = value
+            return {
+                "location": location,
+                "parameter_index": parameter_index,
+                "name": param.name.strip(),
+                "old_value": old,
+                "value": float(param.value),
+                "display": param.str_for_value(param.value),
+                "min": float(param.min),
+                "max": float(param.max),
+            }
+        except Exception as e:
+            self.log_message("Error setting nested device parameter: " + str(e))
+            raise
 
     # ── Passive human-UI listeners ──────────────────────────────────────────────
 

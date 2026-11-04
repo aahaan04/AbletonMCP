@@ -43,6 +43,7 @@ MODIFYING_TOOLS = {
     "set_send",
     "set_track_mute",
     "set_track_solo",
+    "set_nested_device_parameter",
 }
 
 _PARAM_KEYS = (

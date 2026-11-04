@@ -121,6 +121,8 @@ class AbletonConnection:
             # Mixer commands
             "set_track_volume", "set_track_panning", "set_send",
             "set_track_mute", "set_track_solo",
+            # Rack commands
+            "set_nested_device_parameter",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -735,6 +737,9 @@ def add_notes_to_clip(
     """
     Add MIDI notes to a clip.
 
+    On a drum track, call get_drum_pads first and use the pad notes it
+    returns as pitches; never guess which note is which drum.
+
     Parameters:
     - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot containing the clip
@@ -1128,6 +1133,9 @@ def get_browser_items_at_path(ctx: Context, path: str, user_prompt: str = "") ->
 def load_drum_kit(ctx: Context, track_index: int, rack_uri: str, kit_path: str, user_prompt: str = "") -> str:
     """
     Load a drum rack and then load a specific drum kit into it.
+
+    Afterwards call get_drum_pads to learn which note triggers which drum
+    before writing any drum notes.
 
     Parameters:
     - track_index: The index of the track to load on
@@ -1770,6 +1778,168 @@ def set_track_solo(
     except Exception as e:
         logger.error(f"Error setting track solo: {str(e)}")
         return f"Error setting track solo: {str(e)}"
+
+# ── Rack tools: drum pads and devices inside racks ─────────────────────────────
+
+@mcp.tool()
+@telemetry_tool("get_drum_pads")
+@trajectory_tool("get_drum_pads")
+def get_drum_pads(
+    ctx: Context,
+    track_index: int,
+    device_index: Optional[int] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    List the filled pads of a Drum Rack: MIDI note, note name (36 = C1), pad
+    name, and the devices in each pad's chain.
+
+    ALWAYS call this before writing notes to a drum track, and take each
+    drum's pitch from the "note" field here. Never assume General MIDI
+    numbers (36 = kick, 38 = snare): kits differ, and a guessed note plays the
+    wrong drum or nothing.
+
+    Parameters:
+    - track_index: The track holding the Drum Rack
+    - device_index: The Drum Rack's index in the track's devices. Omit when the
+      track has exactly one top-level Drum Rack.
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        ableton = get_ableton_connection()
+        missing = require_capability("get_drum_pads", ableton.send_command)
+        if missing:
+            return missing
+        result = ableton.send_command("get_drum_pads", {
+            "track_index": track_index,
+            "device_index": device_index,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting drum pads: {str(e)}")
+        return f"Error getting drum pads: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("get_nested_device_parameters")
+@trajectory_tool("get_nested_device_parameters")
+def get_nested_device_parameters(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    chain_index: Optional[int] = None,
+    pad_note: Optional[int] = None,
+    nested_device_index: int = 0,
+    path: Optional[List[int]] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Read the parameters of a device inside a rack (Drum Rack, Instrument Rack,
+    Audio Effect Rack, MIDI Effect Rack).
+
+    Address the device with exactly one of:
+    - pad_note: a Drum Rack pad's MIDI note (from get_drum_pads), or
+    - chain_index: the chain's index in the rack (any rack type; get_drum_pads
+      also reports each pad's chain_index)
+    then nested_device_index for the device in that chain.
+
+    Racks can nest (stock drum kits put an Instrument Rack on each pad, with
+    the sampler inside it). The result lists a nested rack's chains and
+    devices; to reach one, add path=[chain_index, device_index, ...] pairs,
+    e.g. path=[0, 0] for the first device of the nested rack's first chain.
+
+    Parameters:
+    - track_index: The track holding the rack
+    - device_index: The rack's index in the track's devices
+    - chain_index: Chain in the rack (give this or pad_note)
+    - pad_note: Drum Rack pad note, 0-127 (give this or chain_index)
+    - nested_device_index: Device index within that chain (default 0)
+    - path: Optional deeper [chain_index, device_index, ...] pairs
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        ableton = get_ableton_connection()
+        missing = require_capability("get_nested_device_parameters", ableton.send_command)
+        if missing:
+            return missing
+        result = ableton.send_command("get_nested_device_parameters", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "chain_index": chain_index,
+            "pad_note": pad_note,
+            "nested_device_index": nested_device_index,
+            "path": path,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting nested device parameters: {str(e)}")
+        return f"Error getting nested device parameters: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("set_nested_device_parameter")
+@trajectory_tool("set_nested_device_parameter")
+def set_nested_device_parameter(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    value: float,
+    chain_index: Optional[int] = None,
+    pad_note: Optional[int] = None,
+    nested_device_index: int = 0,
+    path: Optional[List[int]] = None,
+    parameter_index: Optional[int] = None,
+    parameter_name: Optional[str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Set one parameter of a device inside a rack, e.g. a kick pad's Decay or
+    Transpose. Addressing is the same as get_nested_device_parameters; read
+    that first for parameter names, indices and min/max ranges.
+
+    Give exactly one of parameter_name (case-insensitive exact match) or
+    parameter_index. value is in the parameter's own units and must lie
+    within its min..max; out-of-range values are refused, not clamped.
+
+    Parameters:
+    - track_index: The track holding the rack
+    - device_index: The rack's index in the track's devices
+    - value: New value within the parameter's min..max
+    - chain_index: Chain in the rack (give this or pad_note)
+    - pad_note: Drum Rack pad note, 0-127 (give this or chain_index)
+    - nested_device_index: Device index within that chain (default 0)
+    - path: Optional deeper [chain_index, device_index, ...] pairs
+    - parameter_index: Parameter index (give this or parameter_name)
+    - parameter_name: Parameter name, e.g. "Decay" (give this or parameter_index)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        ableton = get_ableton_connection()
+        missing = require_capability("set_nested_device_parameter", ableton.send_command)
+        if missing:
+            return missing
+        result = ableton.send_command("set_nested_device_parameter", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "value": value,
+            "chain_index": chain_index,
+            "pad_note": pad_note,
+            "nested_device_index": nested_device_index,
+            "path": path,
+            "parameter_index": parameter_index,
+            "parameter_name": parameter_name,
+        })
+        return (
+            f"Set {result.get('location')} > {result.get('name')} "
+            f"{result.get('old_value')} → {result.get('value')} ({result.get('display')})"
+        )
+    except Exception as e:
+        logger.error(f"Error setting nested device parameter: {str(e)}")
+        return f"Error setting nested device parameter: {str(e)}"
 
 # Main execution
 def main():

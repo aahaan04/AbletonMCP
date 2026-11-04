@@ -195,14 +195,18 @@ class ServerOps:
             raise CommandError(out)
 
 
-def find_or_create_selftest_track(client: Client) -> int:
+def find_or_create_track(client: Client, name: str) -> int:
     count = client.send("get_session_info")["track_count"]
     for i in range(count):
-        if client.send("get_track_info", {"track_index": i})["name"] == SELFTEST_TRACK:
+        if client.send("get_track_info", {"track_index": i})["name"] == name:
             return i
     index = client.send("create_midi_track", {"index": -1})["index"]
-    client.send("set_track_name", {"track_index": index, "name": SELFTEST_TRACK})
+    client.send("set_track_name", {"track_index": index, "name": name})
     return index
+
+
+def find_or_create_selftest_track(client: Client) -> int:
+    return find_or_create_track(client, SELFTEST_TRACK)
 
 
 def cmd_selftest_notes(client: Client, via_server: bool) -> int:
@@ -355,10 +359,96 @@ def cmd_selftest_mixer(client: Client, via_server: bool) -> int:
     return c.finish()
 
 
+# --------------------------------------------------------------------------
+# selftest-drums: stock kit -> list pads -> change a pad parameter -> read back
+# --------------------------------------------------------------------------
+
+DRUMS_TRACK = "ableton_cli drums"
+DRUM_KIT = "808 Core Kit.adg"
+
+
+def _pick_param(params, preferred):
+    """A writable, continuous parameter: the first preferred name present,
+    else the first non-'Device On' one."""
+    usable = [p for p in params if p["name"].strip() != "Device On"
+              and p.get("is_enabled", True) and p["max"] > p["min"]]
+    for name in preferred:
+        hit = next((p for p in usable if p["name"].strip() == name), None)
+        if hit:
+            return hit
+    return usable[0] if usable else None
+
+
+def _roundtrip_param(c, ops, label, address, preferred):
+    """Set a nested parameter to a new value, read it back, restore it."""
+    params = ops.run("get_nested_device_parameters", **address)["device"]["parameters"]
+    p = _pick_param(params, preferred)
+    if p is None:
+        c.check(label, False, "no writable parameter")
+        return
+    name, old = p["name"].strip(), p["value"]
+    new = p["min"] + (p["max"] - p["min"]) * (0.25 if old > (p["min"] + p["max"]) / 2 else 0.75)
+    if p.get("is_quantized"):
+        new = float(round(new))
+    try:
+        ops.run("set_nested_device_parameter", value=new, parameter_name=name, **address)
+        back = next(q for q in ops.run("get_nested_device_parameters", **address)["device"]["parameters"]
+                    if q["name"].strip() == name)
+        c.check(label, _close(back["value"], new, 1e-4),
+                f"{name}: {old:g} -> {back['value']:g} ({back.get('value_string', '')})")
+    finally:
+        ops.run("set_nested_device_parameter", value=old, parameter_name=name, **address)
+    restored = next(q for q in ops.run("get_nested_device_parameters", **address)["device"]["parameters"]
+                    if q["name"].strip() == name)
+    c.check(f"{label} restored", _close(restored["value"], old, 1e-4), f"{name} = {restored['value']:g}")
+
+
+def cmd_selftest_drums(client: Client, via_server: bool) -> int:
+    ops = ServerOps() if via_server else RawOps(client)
+    track = find_or_create_track(client, DRUMS_TRACK)
+    if not client.send("get_track_info", {"track_index": track})["devices"]:
+        items = client.send("get_browser_items_at_path", {"path": "drums"})["items"]
+        kit = next((i for i in items if i["name"] == DRUM_KIT), None) \
+            or next(i for i in items if i["name"].endswith(".adg"))
+        client.send("load_browser_item", {"track_index": track, "item_uri": kit["uri"]})
+        print(f"  loaded kit             {kit['name']}")
+    print(f"selftest-drums via {ops.label}: track {track} ({DRUMS_TRACK!r})")
+    c = Checker()
+    try:
+        pads = ops.run("get_drum_pads", track_index=track)
+        listed = pads["pads"]
+        names_ok = all(p["note_name"] == f"{'C C# D D# E F F# G G# A A# B'.split()[p['note'] % 12]}"
+                                       f"{p['note'] // 12 - 2}" for p in listed)
+        c.check("get_drum_pads", pads["pad_count"] > 0 and names_ok,
+                f"{pads['rack_name']}: {pads['pad_count']} pads, "
+                + ", ".join(f"{p['note']}={p['note_name']} {p['name']}" for p in listed[:4]) + ", ...")
+
+        pad = next((p for p in listed if p["note"] == 36), listed[0])
+        address = {"track_index": track, "device_index": pads["device_index"],
+                   "pad_note": pad["note"], "nested_device_index": 0}
+        print(f"  pad                    {pad['note']} {pad['note_name']} {pad['name']!r}: "
+              + ", ".join(d["name"] for d in pad["chains"][0]["devices"]))
+        _roundtrip_param(c, ops, "pad macro", address, ("Decay", "Tone"))
+        if pad["chains"][0]["devices"][0]["is_rack"]:
+            _roundtrip_param(c, ops, "pad sampler (path)", dict(address, path=[0, 0]),
+                             ("Transpose", "Tune", "Decay"))
+
+        empty = next(n for n in range(36, 128) if n not in {p["note"] for p in listed})
+        try:
+            ops.run("get_nested_device_parameters", **dict(address, pad_note=empty))
+            c.check("empty pad refused", False, f"pad {empty} did not error")
+        except CommandError as e:
+            c.check("empty pad refused", "is empty" in str(e), str(e)[-40:])
+    except CommandError as e:
+        c.check("drum commands", False, str(e))
+    return c.finish()
+
+
 SELFTESTS = {
     "selftest-notes": cmd_selftest_notes,
     "selftest-connection": cmd_selftest_connection,
     "selftest-mixer": cmd_selftest_mixer,
+    "selftest-drums": cmd_selftest_drums,
 }
 
 

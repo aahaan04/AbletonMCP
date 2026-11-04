@@ -59,6 +59,7 @@ MODIFYING_TOOLS = {
     "set_groove_amount",
     "set_groove_params",
     "write_drum_pattern",
+    "clear_clip_groove",
 }
 
 _PARAM_KEYS = (

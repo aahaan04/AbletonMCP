@@ -541,22 +541,47 @@ def get_device_parameters(
     ctx: Context,
     track_index: int,
     device_index: int,
+    track_type: str = "track",
+    include_nested: bool = False,
+    name_filter: Optional[str] = None,
     user_prompt: str = "",
 ) -> str:
     """
-    Read all parameters for a device on a track (name, value, min, max).
+    Read a top-level device's parameters (name, value, min, max, display
+    string) on a track, return track or the master.
+
+    By default only the device's own parameters are returned. For a rack
+    (e.g. a Drum Rack) the chains are summarised as a count; nested devices
+    can run to hundreds of KB, so read them one at a time with
+    get_drum_pads / get_nested_device_parameters, or pass include_nested=true.
 
     Parameters:
-    - track_index: Track that owns the device
-    - device_index: Index into the track's device chain
+    - track_index: Track (or return) index; ignored for the master
+    - device_index: Index into that track's device chain
+    - track_type: "track" (default), "return" or "master"
+    - include_nested: Also return every chain and nested device (large for racks)
+    - name_filter: Optional; only parameters whose name contains every word of this text
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command(
-            "get_device_parameters",
-            {"track_index": track_index, "device_index": device_index},
-        )
+        params = {"track_index": track_index, "device_index": device_index,
+                  "include_chains": include_nested}
+        if track_type != "track":
+            from .script_handshake import require_capability
+
+            missing = require_capability("device_params_anywhere", ableton.send_command)
+            if missing:
+                return missing
+            params["track_type"] = track_type
+        result = ableton.send_command("get_device_parameters", params)
+        device = result.get("device", {})
+        if not include_nested and "chains" in device:
+            device["chain_count"] = len(device.pop("chains"))
+            device["chains_omitted"] = "pass include_nested=true or use get_nested_device_parameters"
+        if name_filter:
+            device["parameters"] = [p for p in device.get("parameters", [])
+                                    if _name_matches(p.get("name", ""), name_filter)]
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting device parameters: {str(e)}")
@@ -570,36 +595,52 @@ def set_device_parameter(
     ctx: Context,
     track_index: int,
     device_index: int,
-    parameter_index: int,
-    value: float,
+    parameter_index: Optional[int] = None,
+    value: Optional[float] = None,
+    parameter_name: Optional[str] = None,
+    track_type: str = "track",
     user_prompt: str = "",
 ) -> str:
     """
-    Set a device parameter to a specific value.
+    Set one parameter of a top-level device on a track, return track or the
+    master (e.g. the master Limiter's Ceiling, a return Reverb's Decay Time).
+    For devices inside racks use set_nested_device_parameter.
 
-    Use get_device_parameters first to discover parameter indices and ranges.
+    Give exactly one of parameter_name (case-insensitive exact match) or
+    parameter_index; read get_device_parameters first for names, indices and
+    min..max ranges. value is in the parameter's own units.
 
     Parameters:
-    - track_index: Track that owns the device
-    - device_index: Index into the track's device chain
+    - track_index: Track (or return) index; ignored for the master
+    - device_index: Index into that track's device chain
     - parameter_index: Index into device.parameters
     - value: New parameter value (Live parameter units)
+    - parameter_name: Parameter name instead of parameter_index, e.g. "Ceiling"
+    - track_type: "track" (default), "return" or "master"
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        if value is None:
+            return "Error setting device parameter: value is required"
+        if (parameter_index is None) == (parameter_name is None):
+            return "Error setting device parameter: give exactly one of parameter_index or parameter_name"
         ableton = get_ableton_connection()
-        result = ableton.send_command(
-            "set_device_parameter",
-            {
-                "track_index": track_index,
-                "device_index": device_index,
-                "parameter_index": parameter_index,
-                "value": value,
-            },
-        )
+        params = {"track_index": track_index, "device_index": device_index, "value": value}
+        if track_type != "track" or parameter_name is not None:
+            # Older Remote Scripts ignore these and would set track N's parameter.
+            from .script_handshake import require_capability
+
+            missing = require_capability("device_params_anywhere", ableton.send_command)
+            if missing:
+                return missing
+            params.update(track_type=track_type, parameter_name=parameter_name)
+        if parameter_index is not None:
+            params["parameter_index"] = parameter_index
+        result = ableton.send_command("set_device_parameter", params)
+        shown = f" ({result['display']})" if result.get("display") else ""
         return (
             f"Set {result.get('name', 'parameter')} "
-            f"{result.get('old_value')} → {result.get('value')}"
+            f"{result.get('old_value')} → {result.get('value')}{shown}"
         )
     except Exception as e:
         logger.error(f"Error setting device parameter: {str(e)}")
@@ -1510,13 +1551,24 @@ def get_browser_tree(ctx: Context, category_type: str = "all", user_prompt: str 
 @mcp.tool()
 @rich_telemetry_tool("get_browser_items_at_path")
 @trajectory_tool("get_browser_items_at_path")
-def get_browser_items_at_path(ctx: Context, path: str, user_prompt: str = "") -> str:
+def get_browser_items_at_path(
+    ctx: Context,
+    path: str,
+    name_filter: Optional[str] = None,
+    limit: int = 100,
+    user_prompt: str = ""
+) -> str:
     """
-    Get browser items at a specific path in Ableton's browser.
+    Get browser items at a specific path in Ableton's browser. Big folders
+    (e.g. "sounds/Bass") hold hundreds of presets, so results are capped at
+    `limit`; narrow them with name_filter, or use search_browser to find an
+    item by name anywhere below a category.
 
     Parameters:
     - path: Path in the format "category/folder/subfolder"
             where category is one of the available browser categories in Ableton
+    - name_filter: Optional; keep items whose name contains every word of this text (case-insensitive)
+    - limit: Maximum items returned (default 100)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
@@ -1524,14 +1576,21 @@ def get_browser_items_at_path(ctx: Context, path: str, user_prompt: str = "") ->
         result = ableton.send_command("get_browser_items_at_path", {
             "path": path
         })
-        
+
         # Check if there was an error with available categories
         if "error" in result and "available_categories" in result:
             error = result.get("error", "")
             available_cats = result.get("available_categories", [])
             return (f"Error: {error}\n"
                    f"Available browser categories: {', '.join(available_cats)}")
-        
+
+        items = result.get("items", [])
+        if name_filter:
+            items = [i for i in items if _name_matches(i.get("name", ""), name_filter)]
+        result["total_items"] = len(items)
+        if len(items) > limit:
+            result["truncated"] = f"showing {limit} of {len(items)}; narrow with name_filter"
+        result["items"] = items[:limit]
         return json.dumps(result, indent=2)
     except Exception as e:
         error_msg = str(e)
@@ -1550,6 +1609,83 @@ def get_browser_items_at_path(ctx: Context, path: str, user_prompt: str = "") ->
         else:
             logger.error(f"Error getting browser items at path: {error_msg}")
             return f"Error getting browser items at path: {error_msg}"
+
+def _name_matches(name: str, query: str) -> bool:
+    lowered = name.lower()
+    return all(word in lowered for word in query.lower().split())
+
+
+_SEARCH_ROOTS = ("instruments", "sounds", "drums", "audio_effects", "midi_effects", "user_library")
+_SEARCH_FOLDER_BUDGET = 150
+
+
+@mcp.tool()
+@telemetry_tool("search_browser")
+def search_browser(
+    ctx: Context,
+    query: str,
+    category: str = "all",
+    limit: int = 25,
+    loadable_only: bool = True,
+    user_prompt: str = ""
+) -> str:
+    """
+    Find browser items (instruments, presets, drum kits, effects, samples,
+    grooves) by name, without listing whole folders. Every word of the query
+    must appear in the name, case-insensitively: "808 kit", "bass sub",
+    "reverb hall". Returns name, path and uri; load a result with
+    load_instrument_or_effect(uri=...).
+
+    Parameters:
+    - query: Words to look for in item names
+    - category: "all" (instruments, sounds, drums, audio_effects, midi_effects,
+      user_library) or one of those, or "packs", or a path such as
+      "sounds/Bass" to search below it
+    - limit: Maximum results (default 25, max 200)
+    - loadable_only: Skip folders (default true)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        limit = max(1, min(int(limit), 200))
+        roots = list(_SEARCH_ROOTS) if category == "all" else [category]
+        ableton = get_ableton_connection()
+        if require_capability("search_browser", ableton.send_command) is None:
+            result = ableton.send_command("search_browser", {
+                "query": query, "roots": roots, "limit": limit, "loadable_only": loadable_only})
+            return json.dumps(result, indent=2)
+
+        # Fallback for older Remote Scripts: breadth-first over folder listings.
+        hits, queue, visited, budget_hit = [], list(roots), 0, False
+        while queue and len(hits) < limit:
+            if visited >= _SEARCH_FOLDER_BUDGET:
+                budget_hit = True
+                break
+            path = queue.pop(0)
+            visited += 1
+            try:
+                listing = ableton.send_command("get_browser_items_at_path", {"path": path})
+            except Exception:
+                continue
+            for item in listing.get("items", []):
+                child = f"{path}/{item['name']}"
+                if _name_matches(item["name"], query) and (item.get("is_loadable") or not loadable_only):
+                    hits.append({"name": item["name"], "path": child, "uri": item.get("uri"),
+                                 "is_loadable": item.get("is_loadable"), "is_folder": item.get("is_folder")})
+                    if len(hits) >= limit:
+                        break
+                if item.get("is_folder"):
+                    queue.append(child)
+        result = {"query": query, "results": hits, "count": len(hits), "folders_searched": visited}
+        if budget_hit:
+            result["note"] = (f"stopped after {_SEARCH_FOLDER_BUDGET} folders; "
+                              "search a narrower category or path for more")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error searching browser: {str(e)}")
+        return f"Error searching browser: {str(e)}"
+
 
 @mcp.tool()
 @rich_telemetry_tool("load_drum_kit")
@@ -1631,7 +1767,8 @@ def switch_to_arrangement_view(ctx: Context, user_prompt: str = "") -> str:
 @trajectory_tool("set_arrangement_time")
 def set_arrangement_time(ctx: Context, time: float, user_prompt: str = "") -> str:
     """
-    Move the arrangement playhead to a specific position.
+    Move the arrangement playhead to a specific position. The reported
+    position is read back after Live has applied the move.
 
     Parameters:
     - time: Position in beats from the start of the arrangement (e.g. 8.0 = bar 3 in 4/4)
@@ -1639,8 +1776,20 @@ def set_arrangement_time(ctx: Context, time: float, user_prompt: str = "") -> st
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("set_current_song_time", {"time": time})
-        return f"Playhead moved to beat {result.get('current_song_time', time)}"
+        ableton.send_command("set_current_song_time", {"time": time})
+        # Live applies the move after the command's callback returns, so the
+        # value the command itself reports is the old position; read it again.
+        position = None
+        for _ in range(10):
+            _sleep(0.1)
+            session = ableton.send_command("get_session_info")
+            position = session["current_song_time"]
+            if session.get("is_playing") or abs(position - time) < 1e-3:
+                break
+        if abs(position - time) < 1e-3:
+            return f"Playhead moved to beat {position:g}"
+        return (f"Playhead is at beat {position:g} (asked for {time:g}"
+                + ("; playback is running so it keeps moving)" if session.get("is_playing") else ")"))
     except Exception as e:
         logger.error(f"Error setting arrangement time: {str(e)}")
         return f"Error setting arrangement time: {str(e)}"
@@ -1739,7 +1888,9 @@ def fill_arrangement(
     Place a Session clip into the Arrangement on its own track, repeated
     back-to-back to fill an inclusive bar range. Example: a 4-bar loop
     with start_bar=17, end_bar=32 is placed 4 times, at bars 17, 21, 25, 29.
-    Clip automation envelopes travel with the copies.
+    Clip automation envelopes travel with the copies. The copies are
+    snapshots: after editing the Session clip, call again with replace=true
+    to re-place them.
 
     The range must hold a whole number of repeats of the clip (a 4-bar clip
     cannot fill 6 bars). Existing arrangement clips in the range are refused
@@ -1787,7 +1938,8 @@ def fill_arrangement_section(
     pair is placed back-to-back across the same inclusive bar range, as
     fill_arrangement does for one track. All placements are checked first;
     if any is invalid (wrong length, clip in the way, empty slot) nothing is
-    placed. Each track may appear once per call.
+    placed. Each track may appear once per call. Placed clips are copies:
+    after editing a Session clip, re-run the section with replace=true.
 
     Typical song build: one call per section, e.g. intro bars 1-8, main
     bars 9-24, outro bars 25-32, then set_locator for each section name and
@@ -2139,41 +2291,105 @@ def load_groove(
         return f"Error loading groove: {str(e)}"
 
 
+def _clip_list(clip_index: Optional[int], clip_indexes: Optional[List[int]]) -> List[int]:
+    if (clip_index is None) == (not clip_indexes):
+        raise ValueError("give exactly one of clip_index or clip_indexes")
+    return [clip_index] if clip_index is not None else list(clip_indexes)
+
+
+def _groove_amount_warning(ableton) -> str:
+    amount = ableton.send_command("get_groove_pool")["global_amount"]
+    if amount <= 0:
+        return ("\nWARNING: the global groove amount is 0%, so no groove is heard; raise it "
+                "with set_groove_amount (1.0 = 100%). Clips you don't want swung should get "
+                "clear_clip_groove first, because new clips often carry the Set's default groove.")
+    return ""
+
+
 @mcp.tool()
 @rich_telemetry_tool("assign_groove")
 @trajectory_tool("assign_groove")
 def assign_groove(
     ctx: Context,
     track_index: int,
-    clip_index: int,
     groove_index: int,
+    clip_index: Optional[int] = None,
+    clip_indexes: Optional[List[int]] = None,
     user_prompt: str = ""
 ) -> str:
     """
-    Assign a Groove Pool groove to a Session clip. The groove's timing,
-    velocity and randomness then apply on playback, scaled by the global
-    groove amount. Check the result with get_track_info (each clip's
-    "groove").
+    Assign a Groove Pool groove to one Session clip, or several on the same
+    track (clip_indexes). The groove's timing, velocity and randomness apply
+    on playback, scaled by the global groove amount (shown in get_groove_pool
+    and get_session_info; it is 0% in a new Live 12 Set, which silences every
+    groove). Check per clip with get_track_info ("groove").
 
-    Live's API cannot clear a clip's groove once set. To undo swing, assign a
-    different groove, set this groove's amounts to 0 with set_groove_params
-    (affects every clip using it), or set_groove_amount(0) for the whole Set.
+    To remove swing from a clip use clear_clip_groove. Don't use
+    set_groove_amount(0) for that: it disables every groove in the Set.
 
     Parameters:
-    - track_index: Track holding the clip
-    - clip_index: Session slot index
+    - track_index: Track holding the clip(s)
     - groove_index: Index from get_groove_pool / load_groove
+    - clip_index: One Session slot (give this or clip_indexes)
+    - clip_indexes: Several Session slots on the track
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        result = _gated_call("assign_groove", {
-            "track_index": track_index, "clip_index": clip_index, "groove_index": groove_index})
-        if isinstance(result, str):
-            return result
-        return f"Clip '{result['clip_name']}' groove: {result['groove']}"
+        slots = _clip_list(clip_index, clip_indexes)
+        lines = []
+        for slot in slots:
+            result = _gated_call("assign_groove", {
+                "track_index": track_index, "clip_index": slot, "groove_index": groove_index})
+            if isinstance(result, str):
+                return result
+            lines.append(f"Clip '{result['clip_name']}' (slot {slot}) groove: {result['groove']}")
+        return "\n".join(lines) + _groove_amount_warning(get_ableton_connection())
     except Exception as e:
         logger.error(f"Error assigning groove: {str(e)}")
         return f"Error assigning groove: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("clear_clip_groove")
+@trajectory_tool("clear_clip_groove")
+def clear_clip_groove(
+    ctx: Context,
+    track_index: int,
+    clip_index: Optional[int] = None,
+    clip_indexes: Optional[List[int]] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Make Session clip(s) play straight, with no groove.
+
+    Live's API cannot set a clip's groove to None, so this assigns a neutral
+    groove instead: "AbletonMCP No Groove" in the Set's Groove Pool (Live's
+    "Quantize 16" with timing, random, velocity and quantize all 0), loaded
+    the first time it's needed. Don't change that groove's amounts.
+
+    A new Live 12 Set gives every new clip its default groove ("Swing 16ths
+    66"); clear it on clips that should stay straight before raising the
+    global groove amount.
+
+    Parameters:
+    - track_index: Track holding the clip(s)
+    - clip_index: One Session slot (give this or clip_indexes)
+    - clip_indexes: Several Session slots on the track
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        slots = _clip_list(clip_index, clip_indexes)
+        lines = []
+        for slot in slots:
+            result = _gated_call("clear_clip_groove", {"track_index": track_index, "clip_index": slot})
+            if isinstance(result, str):
+                return result
+            lines.append(f"Clip '{result['clip_name']}' (slot {slot}) now plays straight "
+                         f"(groove '{result['groove']}')")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error clearing clip groove: {str(e)}")
+        return f"Error clearing clip groove: {str(e)}"
 
 
 @mcp.tool()
@@ -2182,7 +2398,10 @@ def assign_groove(
 def set_groove_amount(ctx: Context, amount: float, user_prompt: str = "") -> str:
     """
     Set the global groove amount, which scales every groove in the Set:
-    0.0 = off, 1.0 = 100% (default), up to 1.3 = 130%.
+    0.0 = off, 1.0 = 100%, up to 1.3 = 130%. A new Live 12 Set starts at 0%,
+    so assigned grooves are silent until this is raised. To keep a single
+    clip straight use clear_clip_groove, not 0% here (that silences every
+    groove in the Set).
 
     Parameters:
     - amount: 0.0 to 1.3
@@ -3072,7 +3291,9 @@ def delete_track(
 ) -> str:
     """
     Delete one track (regular MIDI/audio/group track) and everything on it.
-    Live cannot delete its last remaining track.
+    Live cannot delete its last remaining track. Live renumbers auto-named
+    tracks ("3-Audio" becomes "5-Audio") when tracks are inserted, so
+    re-read names right before using expected_name.
 
     Parameters:
     - track_index: The index of the track to delete

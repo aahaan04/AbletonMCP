@@ -710,6 +710,164 @@ def set_track_name(ctx: Context, track_index: int, name: str, user_prompt: str =
         logger.error(f"Error setting track name: {str(e)}")
         return f"Error setting track name: {str(e)}"
 
+# ── Level measurement ──────────────────────────────────────────────────────────
+
+import time as _time
+
+_now = _time.monotonic
+_sleep = _time.sleep
+_METER_INTERVAL_SEC = 0.1
+_MAX_MEASURE_SEC = 120.0
+
+
+def _read_meters(ableton, track_indexes: Optional[List[int]], fast: bool) -> Dict[str, Any]:
+    """One reading: song time plus every wanted track's output_meter_level."""
+    if fast:
+        m = ableton.send_command("get_meters", {})
+        tracks = {t["index"]: t for t in m["tracks"]
+                  if track_indexes is None or t["index"] in track_indexes}
+        return {"time": m["song_time"], "playing": m["is_playing"], "tracks": tracks,
+                "returns": {r["index"]: r for r in m.get("returns", [])}, "master": m["master"]}
+    s = ableton.send_command("get_session_info")
+    indexes = track_indexes if track_indexes is not None else range(s["track_count"])
+    tracks = {}
+    for i in indexes:
+        info = ableton.send_command("get_track_info", {"track_index": i})
+        tracks[i] = {"index": i, "name": info["name"], "level": info.get("output_meter_level")}
+    return {"time": s["current_song_time"], "playing": s["is_playing"], "tracks": tracks,
+            "returns": {}, "master": {"level": s["master_track"].get("output_meter_level")}}
+
+
+class _LevelStats:
+    def __init__(self):
+        self.peak, self.total, self.count = 0.0, 0.0, 0
+
+    def add(self, level):
+        if level is None:
+            return
+        level = float(level)
+        self.peak = max(self.peak, level)
+        self.total += level
+        self.count += 1
+
+    def report(self):
+        if not self.count:
+            return {"peak": None, "mean": None}
+        return {"peak": round(self.peak, 3), "mean": round(self.total / self.count, 3),
+                "clipping": self.peak >= 0.999}
+
+
+@mcp.tool()
+@telemetry_tool("measure_levels")
+def measure_levels(
+    ctx: Context,
+    seconds: float = 8.0,
+    start_bar: Optional[float] = None,
+    settle_seconds: float = 3.0,
+    track_indexes: Optional[List[int]] = None,
+    by_section: bool = False,
+    user_prompt: str = ""
+) -> str:
+    """
+    Play the Set and measure output levels over a time window: peak and mean
+    of Live's meters (0..1, where 1.0 = 0 dBFS, i.e. clipping) per track,
+    return track and the master. Use this to check a mix instead of single
+    get_track_info / get_session_info readings, which catch one instant.
+
+    With start_bar the playhead jumps there and playback starts (and is
+    stopped again afterwards); without it, an already-running playback is
+    measured, or playback starts from the current position. The first
+    settle_seconds are discarded: Live keeps showing earlier peaks for up to
+    ~3 s, which made a silent track read loud right after a jump.
+
+    by_section=true also splits the results by locator section (e.g. Intro,
+    Drop) using the playhead position of each sample, so one long run can
+    compare sections. Keep seconds short (8-30); the call blocks while it plays.
+
+    Parameters:
+    - seconds: Measuring time after settling (max 120)
+    - start_bar: Bar to play from (1-based); omit to use the current position
+    - settle_seconds: Seconds to discard first (default 3)
+    - track_indexes: Tracks to include (default: all)
+    - by_section: Also report per locator section
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        if not 0 < seconds <= _MAX_MEASURE_SEC:
+            return f"Error measuring levels: seconds must be in (0, {_MAX_MEASURE_SEC:g}]"
+        ableton = get_ableton_connection()
+        fast = require_capability("get_meters", ableton.send_command) is None
+        session = ableton.send_command("get_session_info")
+        was_playing, start_time = session["is_playing"], session["current_song_time"]
+        bpb = 4.0 * session["signature_numerator"] / session["signature_denominator"]
+        started = False
+        if start_bar is not None:
+            if was_playing:
+                ableton.send_command("stop_playback")
+            ableton.send_command("set_current_song_time", {"time": (start_bar - 1) * bpb})
+            _sleep(0.15)
+        if start_bar is not None or not was_playing:
+            ableton.send_command("start_playback")
+            started = True
+
+        sections = []
+        if by_section and require_capability("get_locators", ableton.send_command) is None:
+            locs = sorted(ableton.send_command("get_locators")["locators"], key=lambda l: l["time"])
+            sections = [(l["time"], l["name"]) for l in locs]
+
+        totals = {"tracks": {}, "returns": {}, "master": _LevelStats()}
+        per_section: Dict[str, Dict[str, Any]] = {}
+        names = {}
+        samples = 0
+        try:
+            settle_until = _now() + max(0.0, settle_seconds)
+            end = settle_until + seconds
+            while _now() < end:
+                reading = _read_meters(ableton, track_indexes, fast)
+                if _now() >= settle_until:
+                    samples += 1
+                    section = None
+                    for t0, name in sections:
+                        if reading["time"] >= t0 - 1e-6:
+                            section = name
+                    buckets = [totals]
+                    if section is not None:
+                        buckets.append(per_section.setdefault(
+                            section, {"tracks": {}, "returns": {}, "master": _LevelStats()}))
+                    for b in buckets:
+                        for kind in ("tracks", "returns"):
+                            for i, t in reading[kind].items():
+                                names[(kind, i)] = t.get("name")
+                                b[kind].setdefault(i, _LevelStats()).add(t.get("level"))
+                        b["master"].add(reading["master"].get("level"))
+                _sleep(_METER_INTERVAL_SEC)
+        finally:
+            if started:
+                ableton.send_command("stop_playback")
+                if start_bar is not None:
+                    ableton.send_command("set_current_song_time", {"time": start_time})
+
+        def render(b):
+            out = {"master": b["master"].report(),
+                   "tracks": [dict(index=i, name=names.get(("tracks", i)), **s.report())
+                              for i, s in sorted(b["tracks"].items())]}
+            if b["returns"]:
+                out["returns"] = [dict(index=i, name=names.get(("returns", i)), **s.report())
+                                  for i, s in sorted(b["returns"].items())]
+            return out
+
+        result = {"samples": samples, "seconds": seconds, "settle_seconds": settle_seconds,
+                  "source": "get_meters" if fast else "track info polling", **render(totals)}
+        if by_section:
+            result["sections"] = {name: render(b) for name, b in per_section.items()}
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error measuring levels: {str(e)}")
+        return f"Error measuring levels: {str(e)}"
+
+
 # ── Note writing helpers (compact notes, repeats, drum steps) ──────────────────
 
 NoteInput = Union[List[float], Dict[str, Union[int, float, bool]]]

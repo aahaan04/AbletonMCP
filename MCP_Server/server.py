@@ -1767,30 +1767,31 @@ def assign_groove(
     ctx: Context,
     track_index: int,
     clip_index: int,
-    groove_index: Optional[int] = None,
-    remove: bool = False,
+    groove_index: int,
     user_prompt: str = ""
 ) -> str:
     """
-    Assign a Groove Pool groove to a Session clip (the groove's timing,
+    Assign a Groove Pool groove to a Session clip. The groove's timing,
     velocity and randomness then apply on playback, scaled by the global
-    groove amount), or remove the clip's groove with remove=true. Give
-    exactly one of groove_index or remove.
+    groove amount. Check the result with get_track_info (each clip's
+    "groove").
+
+    Live's API cannot clear a clip's groove once set. To undo swing, assign a
+    different groove, set this groove's amounts to 0 with set_groove_params
+    (affects every clip using it), or set_groove_amount(0) for the whole Set.
 
     Parameters:
     - track_index: Track holding the clip
     - clip_index: Session slot index
     - groove_index: Index from get_groove_pool / load_groove
-    - remove: true to clear the clip's groove
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         result = _gated_call("assign_groove", {
-            "track_index": track_index, "clip_index": clip_index,
-            "groove_index": groove_index, "remove": remove})
+            "track_index": track_index, "clip_index": clip_index, "groove_index": groove_index})
         if isinstance(result, str):
             return result
-        return f"Clip '{result['clip_name']}' groove: {result['groove'] or 'none'}"
+        return f"Clip '{result['clip_name']}' groove: {result['groove']}"
     except Exception as e:
         logger.error(f"Error assigning groove: {str(e)}")
         return f"Error assigning groove: {str(e)}"
@@ -2512,6 +2513,9 @@ def get_clip_automation(
     Read a clip's automation envelope for one parameter, sampled at given
     times (beats from the clip start; default: 9 points spread over the clip).
     Returns has_envelope=false when the parameter is not automated in this clip.
+    Session clips only in practice: Live does not expose Arrangement clips'
+    envelopes, so view="arrangement" always reports has_envelope=false even
+    though envelopes copied there by fill_arrangement do play.
     
     target picks the parameter, on the same track as the clip. Either:
     - a mixer control: {"mixer": "volume"} | {"mixer": "panning"} |

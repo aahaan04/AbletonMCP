@@ -79,14 +79,13 @@ def test_load_refuses_unknown_or_ambiguous(live):
         live._load_groove(uri="u:57", name="x")
 
 
-def test_assign_and_remove(live):
+def test_assign_and_bad_index(live):
     live._load_groove(name="Swing MPC 3000 8ths 57")
-    assert live._assign_groove(0, 0, groove_index=0)["groove"] == "Swing MPC 3000 8ths 57"
-    assert live._assign_groove(0, 0, remove=True)["groove"] is None
+    assert live._assign_groove(0, 0, 0)["groove"] == "Swing MPC 3000 8ths 57"
     with pytest.raises(IndexError, match="out of range"):
-        live._assign_groove(0, 0, groove_index=3)
-    with pytest.raises(ValueError, match="either groove_index or remove"):
-        live._assign_groove(0, 0)
+        live._assign_groove(0, 0, 3)
+    with pytest.raises(IndexError, match="out of range"):
+        live._assign_groove(0, 0, None)
 
 
 def test_pool_amount_and_params(live):

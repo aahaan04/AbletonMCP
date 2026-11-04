@@ -666,7 +666,7 @@ class AbletonMCP(ControlSurface):
             elif command_type == "assign_groove":
                 response["result"] = self._assign_groove(
                     params.get("track_index", 0), params.get("clip_index", 0),
-                    params.get("groove_index"), params.get("remove", False))
+                    params.get("groove_index"))
             elif command_type == "set_groove_amount":
                 response["result"] = self._set_groove_amount(params.get("amount"))
             elif command_type == "set_groove_params":
@@ -2447,6 +2447,10 @@ class AbletonMCP(ControlSurface):
                       "length": length, "min": float(param.min), "max": float(param.max),
                       "has_envelope": envelope is not None}
             if envelope is None:
+                if view == "arrangement":
+                    result["note"] = ("Live's API does not expose envelopes of Arrangement clips, "
+                                      "so has_envelope is always false here; envelopes copied from "
+                                      "a Session clip do play")
                 return result
             if times is None:
                 times = [length * i / 8.0 for i in range(8)] + [max(0.0, length - 1e-3)]
@@ -2666,7 +2670,9 @@ class AbletonMCP(ControlSurface):
         time in [time_min, time_max)). Exactly one of the two forms."""
         if not isinstance(selection, dict) or not selection:
             raise ValueError("selection is required: note_ids, or a pitch/time range")
-        notes = list(clip.get_notes_extended(0, 128, 0.0, 1e6))
+        # Keep Live's own note vector: apply_note_modifications accepts only that
+        # object (not a list), and edits made to its notes while iterating it.
+        notes = clip.get_notes_extended(0, 128, 0.0, 1e6)
         ids = selection.get("note_ids")
         range_keys = [k for k in ("pitch_min", "pitch_max", "time_min", "time_max") if k in selection]
         if (ids is None) == (not range_keys):
@@ -2826,20 +2832,16 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error loading groove: " + str(e))
             raise
 
-    def _assign_groove(self, track_index, clip_index, groove_index=None, remove=False):
+    def _assign_groove(self, track_index, clip_index, groove_index):
+        # Live's API only accepts a pool groove here; clip.groove = None is
+        # rejected, so a clip's groove cannot be cleared from a Remote Script.
         try:
-            if (groove_index is None) == (not remove):
-                raise ValueError("Give either groove_index or remove=true")
             _, clip = self._automation_clip(track_index, clip_index, "session")
-            if remove:
-                clip.groove = None
-            else:
-                grooves = self._grooves()
-                if groove_index < 0 or groove_index >= len(grooves):
-                    raise IndexError("groove_index %s out of range (pool has %d)" % (groove_index, len(grooves)))
-                clip.groove = grooves[groove_index]
-            g = clip.groove
-            return {"clip_name": clip.name, "groove": str(g.name) if g is not None else None}
+            grooves = self._grooves()
+            if groove_index is None or groove_index < 0 or groove_index >= len(grooves):
+                raise IndexError("groove_index %s out of range (pool has %d)" % (groove_index, len(grooves)))
+            clip.groove = grooves[groove_index]
+            return {"clip_name": clip.name, "groove": str(clip.groove.name)}
         except Exception as e:
             self.log_message("Error assigning groove: " + str(e))
             raise

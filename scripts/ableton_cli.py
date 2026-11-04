@@ -722,11 +722,26 @@ def cmd_selftest_arrangement(client: Client, via_server: bool) -> int:
             c.check("track B positions", got_b == want_b and not tb["gaps"] and not tb["overlaps"],
                     f"{len(got_b)} clips, bars {got_b[0][1]:g}-{got_b[-1][2]:g}")
 
-            env = ops.run("get_clip_automation", track_index=b, clip_index=1, target=cutoff,
-                          view="arrangement", times=[0, 8, 15.9])
-            vals = [s["value"] for s in env.get("samples", [])]
-            c.check("envelope carried over", env["has_envelope"] and len(vals) == 3 and vals == sorted(vals)
-                    and vals[0] < vals[-1], ", ".join(s["display"] for s in env.get("samples", [])))
+            # Live hides Arrangement clips' envelopes from the API, so prove the
+            # envelope came across by playing B's second intro copy (bars 5-8,
+            # cutoff 0.2 -> 0.8) soloed, and watching the parameter move.
+            vals = []
+            restore = client.send("get_session_info")["current_song_time"]
+            client.send("set_track_solo", {"track_index": b, "solo": True})
+            try:
+                client.send("set_current_song_time", {"time": 4 * bpb})
+                client.send("start_playback")
+                for _ in range(5):
+                    time.sleep(0.6)
+                    params = client.send("get_device_parameters", {"track_index": b, "device_index": 0})
+                    vals.append(next(p["value"] for p in params["device"]["parameters"]
+                                     if p["name"].strip() == cutoff["parameter_name"]))
+            finally:
+                client.send("stop_playback")
+                client.send("set_track_solo", {"track_index": b, "solo": False})
+                client.send("set_current_song_time", {"time": restore})
+            c.check("envelope plays in arrangement", vals == sorted(vals) and vals[-1] - vals[0] > 0.1
+                    and 0.19 < vals[0] and vals[-1] < 0.81, ", ".join(f"{v:.2f}" for v in vals))
 
             try:
                 ops.run("fill_arrangement", track_index=a, clip_index=0, start_bar=9, end_bar=10)
@@ -838,10 +853,8 @@ def cmd_selftest_grooves(client: Client, via_server: bool) -> int:
             ops.run("assign_groove", track_index=track, clip_index=0, groove_index=index)
             clip = client.send("get_track_info", {"track_index": track})["clip_slots"][0]["clip"]
             c.check("assigned", clip.get("groove") == SWING_GROOVE, str(clip.get("groove")))
-
-            ops.run("assign_groove", track_index=track, clip_index=0, remove=True)
-            clip = client.send("get_track_info", {"track_index": track})["clip_slots"][0]["clip"]
-            c.check("removed", clip.get("groove") is None, str(clip.get("groove")))
+            # Live's API cannot clear a clip's groove; the clip goes with its temp track.
+            c.info("remove", "not possible via Live's API; clip deleted with the temp track")
         except CommandError as e:
             c.check("groove commands", False, str(e))
     pool1 = client.send("get_groove_pool")

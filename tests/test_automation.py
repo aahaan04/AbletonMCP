@@ -28,6 +28,8 @@ class Envelope:
         self.steps.append((time, length, value))
 
     def value_at_time(self, t):
+        if t == 0:   # Live returns the loop-end value at exactly the clip start
+            return self.steps[-1][2]
         hits = [v for (s, l, v) in self.steps if s <= t < s + l]
         return hits[-1] if hits else self.steps[-1][2]
 

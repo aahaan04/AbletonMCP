@@ -2450,7 +2450,9 @@ class AbletonMCP(ControlSurface):
                 times = [length * i / 8.0 for i in range(8)] + [max(0.0, length - 1e-3)]
             samples = []
             for t in times:
-                v = float(envelope.value_at_time(float(t)))
+                # value_at_time(0) returns the loop-end value (Live treats the
+                # clip start as the loop wrap point), so read just after it.
+                v = float(envelope.value_at_time(max(float(t), 1e-4)))
                 samples.append({"time": float(t), "value": v, "display": param.str_for_value(v)})
             result["samples"] = samples
             return result

@@ -19,8 +19,8 @@ uv run python scripts\ableton_cli.py selftest-notes --via-server   # through MCP
 uv run python scripts\ableton_cli.py get_track_info track_index=0  # any command
 
 # Run every selftest both ways (PowerShell):
-foreach ($t in 'notes','connection','mixer','drums','deletes') { foreach ($v in '', '--via-server') {
-  uv run python scripts\ableton_cli.py "selftest-$t" $v } }
+foreach ($t in 'notes','connection','mixer','drums','deletes','returns','automation','meters') {
+  foreach ($v in '', '--via-server') { uv run python scripts\ableton_cli.py "selftest-$t" $v } }
 
 # 3. Unit tests (no Live needed).
 uv run --with pytest pytest -q
@@ -31,15 +31,33 @@ it starts a fresh `uv run ableton-mcp` from this checkout.
 
 ## Selftests
 
-| Selftest | Exercises | Leaves behind |
-|----------|-----------|---------------|
-| `selftest-notes` | create clip → add → read → clear → read empty → delete clip | track "ableton_cli selftest" (reused) |
-| `selftest-connection` | >8 KiB multi-byte replies; error then reconnect | same track, name restored |
-| `selftest-mixer` | volume dB, pan, mute, solo, send A → read back → defaults | same track, defaults restored |
-| `selftest-drums` | 808 Core Kit pads; pad macro and nested sampler param set/read/restore; empty pad refused | track "ableton_cli drums" with the kit (reused) |
-| `selftest-deletes` | throwaway track: delete arrangement clip, session clip, nested device, device (wrong name refused first), track; return delete with wrong name refused | nothing |
+Every selftest builds on a throwaway track ("ableton_cli temp") and deletes it,
+plus any return or master device it added, so the Set is left as it was found.
+Deletes use `expected_name`, so a stale name refuses rather than deleting
+something else; if a run is interrupted, look for "ableton_cli …" tracks or
+extra returns.
+
+| Selftest | Exercises |
+|----------|-----------|
+| `selftest-notes` | create clip → add → read → clear → read empty |
+| `selftest-connection` | >8 KiB multi-byte replies; error then reconnect |
+| `selftest-mixer` | volume dB, pan, mute, solo, send A → read back |
+| `selftest-drums` | 808 Core Kit pads; pad macro and nested sampler param set → read back; empty pad refused |
+| `selftest-deletes` | arrangement clip, session clip, nested device, device (wrong name refused first), a new return track, the track |
+| `selftest-returns` | new return + Reverb, send to it, Limiter on master → read back → removed |
+| `selftest-automation` | 8-bar Auto Filter sweep + volume fade → sampled back → clear one, clear all; probes Arrangement (Live refuses) |
+| `selftest-meters` | kick loop: track/master meters > 0.05 while playing, fall < 0.01 after stop (Live holds the peak up to ~3 s) |
 
 Set `PYTHONIOENCODING=utf-8` if the console mangles the multi-byte output.
+`selftest-meters` plays audio for a few seconds.
+
+## Batching Remote Script changes
+
+Each Remote Script change costs a full Live restart. Build and unit-test several
+changes, run `dev_install.ps1` once, restart once, then run every selftest both
+ways. A capability that only adds parameters to an existing command goes in
+`SCRIPT_FEATURES`, not `SCRIPT_CAPABILITIES` (which must list exactly the
+dispatchable commands; a test enforces it).
 
 ## Upstream PRs
 

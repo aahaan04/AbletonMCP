@@ -407,6 +407,11 @@ def set_dataset_consent(ctx: Context, consent: bool, user_said: str = "") -> str
 def get_session_info(ctx: Context, user_prompt: str = "") -> str:
     """Get detailed information about the current Ableton session
 
+    master_track includes output_meter_left / output_meter_right /
+    output_meter_level: Live's instantaneous output meters, 0..1 (1 = clipping
+    at 0 dBFS), or null where Live has no reading. They are live peaks, so
+    sample a few times while playing to judge loudness.
+
     Parameters:
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
@@ -447,6 +452,10 @@ def get_remote_script_info(ctx: Context, user_prompt: str = "") -> str:
 def get_track_info(ctx: Context, track_index: int, user_prompt: str = "") -> str:
     """
     Get detailed information about a specific track in Ableton.
+
+    Includes output_meter_left / output_meter_right / output_meter_level:
+    the track's instantaneous output meters, 0..1, or null where Live has no
+    reading (e.g. MIDI tracks without an instrument).
 
     Parameters:
     - track_index: The index of the track to get information about

@@ -2405,7 +2405,10 @@ class AbletonMCP(ControlSurface):
                     steps.append((t, seg, v0 + (v1 - v0) * (t - t0) / (t1 - t0)))
                     t += seg
             last_t, last_v = resolved[-1]
-            steps.append((last_t, max(length - last_t, resolution), last_v))
+            # Hold the last value to the clip end. A step starting at or past
+            # the end wraps to beat 0 in Live and overwrites the start.
+            if length - last_t > 1e-9:
+                steps.append((last_t, length - last_t, last_v))
             if len(steps) > 4096:
                 raise ValueError("Envelope would need %d steps; raise resolution" % len(steps))
             for t, seg, v in steps:

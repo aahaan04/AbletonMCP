@@ -95,11 +95,21 @@ def test_rising_ramp_is_drawn_and_reads_back_monotonic(live):
     out = live._write_clip_automation(0, 0, CUTOFF, [{"time": 0, "normalized": 0.1},
                                                      {"time": 32, "normalized": 0.9}], resolution=1.0)
     assert out["location"] == "Auto Filter > Frequency"
-    assert out["steps"] == 32 + 1   # 32 one-beat ramp steps + tail
+    assert out["steps"] == 32       # 32 one-beat ramp steps; last point is the clip end, so no tail
     got = live._get_clip_automation(0, 0, CUTOFF, times=[0, 8, 16, 24, 31])
     values = [s["value"] for s in got["samples"]]
     assert got["has_envelope"] and values == sorted(values)
     assert values[0] == pytest.approx(0.1) and values[2] == pytest.approx(0.5)
+
+
+def test_no_step_starts_at_or_past_the_clip_end(live):
+    """Live wraps a step that starts at the clip end to beat 0, which made an
+    8-bar sweep read its final value at the start."""
+    live._write_clip_automation(0, 0, CUTOFF, [{"time": 0, "value": 0.1}, {"time": 32, "value": 0.9}])
+    steps = live._song.tracks[0].clip_slots[0].clip.automation_envelope(
+        live._song.tracks[0].devices[0].parameters[1]).steps
+    assert all(t < 32.0 and t + l <= 32.0 + 1e-9 for t, l, _ in steps)
+    assert steps[0] == (0.0, 0.0625, pytest.approx(0.1))
 
 
 def test_holds_before_first_and_after_last_point(live):

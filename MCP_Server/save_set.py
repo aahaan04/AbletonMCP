@@ -227,21 +227,27 @@ if sys.platform == "win32":
 
     def fill_and_confirm(dialog, path: str) -> None:
         """Put the path into the file-name box and press Save, no typing."""
-        kids = _children(dialog)
-        # The file-name box is the Edit inside the ComboBoxEx32 with control id 1148.
-        combo = [h for h in kids if _class(h) == "ComboBoxEx32" and user32.GetDlgCtrlID(h) == 1148]
-        edits = [h for h in kids if _class(h) == "Edit" and combo
-                 and any(_is_descendant(h, c) for c in combo)]
+        kids = [h for h in _children(dialog) if user32.IsWindowVisible(h)]
+        # The file-name box: in the Explorer-style dialog Live uses, an Edit
+        # with control id 1001 inside a ComboBox; in the older layout, the
+        # Edit inside the ComboBoxEx32 with control id 1148.
+        edits = [h for h in kids if _class(h) == "Edit" and user32.GetDlgCtrlID(h) == 1001
+                 and _class(user32.GetParent(h)) == "ComboBox"]
+        if not edits:
+            combo = [h for h in kids if _class(h) == "ComboBoxEx32" and user32.GetDlgCtrlID(h) == 1148]
+            edits = [h for h in kids if _class(h) == "Edit" and any(_is_descendant(h, c) for c in combo)]
         save = [h for h in kids if _class(h) == "Button" and user32.GetDlgCtrlID(h) == IDOK]
         if len(edits) != 1 or len(save) != 1:
             raise SaveError("Could not identify the Save dialog's file name box and Save button")
         if _pid(dialog) != _pid(edits[0]):
             raise SaveError("Save dialog controls belong to another process")
-        user32.SendMessageW(edits[0], WM_SETTEXT, 0, ctypes.cast(ctypes.c_wchar_p(path), ctypes.c_void_p).value)
+        # Keep both buffers referenced for the duration of the calls.
+        text = ctypes.create_unicode_buffer(path)
+        user32.SendMessageW(edits[0], WM_SETTEXT, 0, ctypes.addressof(text))
         buf = ctypes.create_unicode_buffer(1024)
-        user32.SendMessageW(edits[0], WM_GETTEXT, 1024, ctypes.cast(buf, ctypes.c_void_p).value)
+        user32.SendMessageW(edits[0], WM_GETTEXT, 1024, ctypes.addressof(buf))
         if buf.value != path:
-            raise SaveError("Could not set the file name in Live's Save dialog")
+            raise SaveError(f"Could not set the file name in Live's Save dialog (it reads {buf.value!r})")
         user32.SendMessageW(save[0], BM_CLICK, 0, 0)
 
     def _is_descendant(hwnd, ancestor) -> bool:

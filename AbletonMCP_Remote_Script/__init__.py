@@ -36,7 +36,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.11.0"
+SCRIPT_VERSION = "1.11.1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [

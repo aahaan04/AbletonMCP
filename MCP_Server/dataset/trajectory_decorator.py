@@ -41,6 +41,8 @@ MODIFYING_TOOLS = {
     "set_track_volume",
     "set_track_panning",
     "set_send",
+    "set_track_mute",
+    "set_track_solo",
 }
 
 _PARAM_KEYS = (

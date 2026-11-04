@@ -118,6 +118,10 @@ class RawOps:
     def get_track_info(self, t):
         return self.c.send("get_track_info", {"track_index": t})
 
+    def run(self, command, **params):
+        """Any other command, by its Remote Script name."""
+        return self.c.send(command, params)
+
 
 class ServerOps:
     """Selftest steps through the MCP server's tool functions, in-process.
@@ -166,6 +170,22 @@ class ServerOps:
 
     def get_track_info(self, t):
         return self._json(self._call(self.server.get_track_info, t))
+
+    def run(self, command, **params):
+        """Any other command, through the MCP tool of the same name. Tools
+        that return prose are checked for an error prefix; JSON is decoded."""
+        import asyncio
+        import inspect
+
+        out = getattr(self.server, command)(None, **params)
+        if inspect.iscoroutine(out):
+            out = asyncio.run(out)
+        if out.startswith(("Error", "Ableton Remote Script missing")):
+            raise CommandError(out)
+        try:
+            return json.loads(out)
+        except ValueError:
+            return {"message": out}
 
     @staticmethod
     def _json(out):
@@ -270,9 +290,75 @@ def cmd_selftest_connection(client: Client, via_server: bool) -> int:
     return 1 if failures else 0
 
 
+# --------------------------------------------------------------------------
+# selftest-mixer: volume, pan, mute, solo, send -> read back -> defaults
+# --------------------------------------------------------------------------
+
+class Checker:
+    def __init__(self):
+        self.failures = 0
+
+    def check(self, label, ok, detail=""):
+        print(f"  {label:<22} {'ok' if ok else 'FAIL'}{f' ({detail})' if detail else ''}")
+        if not ok:
+            self.failures += 1
+
+    def finish(self):
+        print("PASS" if not self.failures else f"FAIL ({self.failures})")
+        return 1 if self.failures else 0
+
+
+def _close(a, b, tol):
+    return a is not None and abs(a - b) <= tol
+
+
+def cmd_selftest_mixer(client: Client, via_server: bool) -> int:
+    ops = ServerOps() if via_server else RawOps(client)
+    track = find_or_create_selftest_track(client)
+    returns = client.send("get_session_info")["return_track_count"]
+    print(f"selftest-mixer via {ops.label}: track {track} ({SELFTEST_TRACK!r}), {returns} return track(s)")
+    c = Checker()
+    try:
+        ops.run("set_track_volume", track_index=track, db=-6.0)
+        ops.run("set_track_panning", track_index=track, value=0.5)
+        ops.run("set_track_mute", track_index=track, mute=True)
+        ops.run("set_track_solo", track_index=track, solo=True)
+        if returns:
+            ops.run("set_send", track_index=track, send_index=0, db=-12.0)
+        m = ops.run("get_mixer", track_index=track)
+        c.check("volume -6 dB", _close(m["volume"]["db"], -6.0, 0.05), m["volume"]["display"])
+        c.check("pan 0.5", _close(m["panning"]["value"], 0.5, 1e-3), m["panning"]["display"])
+        c.check("mute on", m["mute"] is True)
+        c.check("solo on", m["solo"] is True)
+        if returns:
+            s = m["sends"][0]
+            c.check("send A -12 dB", _close(s["db"], -12.0, 0.05), f"{s['name']}: {s['display']}")
+        else:
+            print("  send                   skipped (no return tracks in this set)")
+    except CommandError as e:
+        c.check("mixer commands", False, str(e))
+    finally:
+        ops.run("set_track_volume", track_index=track, db=0.0)
+        ops.run("set_track_panning", track_index=track, value=0.0)
+        ops.run("set_track_mute", track_index=track, mute=False)
+        ops.run("set_track_solo", track_index=track, solo=False)
+        if returns:
+            ops.run("set_send", track_index=track, send_index=0, value=0.0)
+    m = ops.run("get_mixer", track_index=track)
+    restored = (_close(m["volume"]["db"], 0.0, 0.05) and _close(m["panning"]["value"], 0.0, 1e-3)
+                and m["mute"] is False and m["solo"] is False
+                and (not returns or m["sends"][0]["value"] == 0.0))
+    c.check("defaults restored", restored,
+            f"vol {m['volume']['display']}, pan {m['panning']['display']}, "
+            f"mute {m['mute']}, solo {m['solo']}"
+            + (f", send A {m['sends'][0]['display']}" if returns else ""))
+    return c.finish()
+
+
 SELFTESTS = {
     "selftest-notes": cmd_selftest_notes,
     "selftest-connection": cmd_selftest_connection,
+    "selftest-mixer": cmd_selftest_mixer,
 }
 
 

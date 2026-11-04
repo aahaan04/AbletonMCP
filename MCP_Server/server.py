@@ -117,7 +117,10 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator"
+            "create_locator",
+            # Mixer commands
+            "set_track_volume", "set_track_panning", "set_send",
+            "set_track_mute", "set_track_solo",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -1553,7 +1556,12 @@ def get_mixer(ctx: Context, track_index: int = 0, track_type: str = "track",
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        from .script_handshake import require_capability
+
         ableton = get_ableton_connection()
+        missing = require_capability("get_mixer", ableton.send_command)
+        if missing:
+            return missing
         result = ableton.send_command("get_mixer", {
             "track_index": track_index,
             "track_type": track_type
@@ -1591,7 +1599,12 @@ def set_track_volume(
     try:
         if db is None and value is None:
             return "Error: provide either db or value"
+        from .script_handshake import require_capability
+
         ableton = get_ableton_connection()
+        missing = require_capability("set_track_volume", ableton.send_command)
+        if missing:
+            return missing
         result = ableton.send_command("set_track_volume", {
             "track_index": track_index,
             "db": db,
@@ -1623,7 +1636,12 @@ def set_track_panning(
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        from .script_handshake import require_capability
+
         ableton = get_ableton_connection()
+        missing = require_capability("set_track_panning", ableton.send_command)
+        if missing:
+            return missing
         result = ableton.send_command("set_track_panning", {
             "track_index": track_index,
             "value": value,
@@ -1662,7 +1680,12 @@ def set_send(
     try:
         if db is None and value is None:
             return "Error: provide either db or value"
+        from .script_handshake import require_capability
+
         ableton = get_ableton_connection()
+        missing = require_capability("set_send", ableton.send_command)
+        if missing:
+            return missing
         result = ableton.send_command("set_send", {
             "track_index": track_index,
             "send_index": send_index,
@@ -1674,6 +1697,79 @@ def set_send(
     except Exception as e:
         logger.error(f"Error setting send: {str(e)}")
         return f"Error setting send: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("set_track_mute")
+@trajectory_tool("set_track_mute")
+def set_track_mute(
+    ctx: Context,
+    track_index: int,
+    mute: bool,
+    track_type: str = "track",
+    user_prompt: str = ""
+) -> str:
+    """
+    Mute or unmute a track. The master track has no mute.
+
+    Parameters:
+    - track_index: The index of the track
+    - mute: True to mute, False to unmute
+    - track_type: "track" (default) or "return"
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        ableton = get_ableton_connection()
+        missing = require_capability("set_track_mute", ableton.send_command)
+        if missing:
+            return missing
+        result = ableton.send_command("set_track_mute", {
+            "track_index": track_index,
+            "mute": mute,
+            "track_type": track_type
+        })
+        return f"{'Muted' if result.get('mute') else 'Unmuted'} '{result.get('name')}'"
+    except Exception as e:
+        logger.error(f"Error setting track mute: {str(e)}")
+        return f"Error setting track mute: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("set_track_solo")
+@trajectory_tool("set_track_solo")
+def set_track_solo(
+    ctx: Context,
+    track_index: int,
+    solo: bool,
+    track_type: str = "track",
+    user_prompt: str = ""
+) -> str:
+    """
+    Solo or unsolo a track. The master track has no solo. With Live's
+    exclusive-solo preference on, soloing one track unsolos the others.
+
+    Parameters:
+    - track_index: The index of the track
+    - solo: True to solo, False to unsolo
+    - track_type: "track" (default) or "return"
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        ableton = get_ableton_connection()
+        missing = require_capability("set_track_solo", ableton.send_command)
+        if missing:
+            return missing
+        result = ableton.send_command("set_track_solo", {
+            "track_index": track_index,
+            "solo": solo,
+            "track_type": track_type
+        })
+        return f"{'Soloed' if result.get('solo') else 'Unsoloed'} '{result.get('name')}'"
+    except Exception as e:
+        logger.error(f"Error setting track solo: {str(e)}")
+        return f"Error setting track solo: {str(e)}"
 
 # Main execution
 def main():

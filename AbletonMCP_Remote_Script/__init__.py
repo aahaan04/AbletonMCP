@@ -57,6 +57,12 @@ SCRIPT_CAPABILITIES = [
     "create_locator",
     "delete_clip",
     "clear_notes_from_clip",
+    "get_mixer",
+    "set_track_volume",
+    "set_track_panning",
+    "set_send",
+    "set_track_mute",
+    "set_track_solo",
 ]
 
 def create_instance(c_instance):
@@ -305,7 +311,8 @@ class AbletonMCP(ControlSurface):
                                  "map_rack_magnitude", "inspect_rack",
                                  "create_locator",
                                  # Mixer – must run on the main thread
-                                 "set_track_volume", "set_track_panning", "set_send"]:
+                                 "set_track_volume", "set_track_panning", "set_send",
+                                 "set_track_mute", "set_track_solo"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -423,6 +430,16 @@ class AbletonMCP(ControlSurface):
                                 params.get("send_index", 0),
                                 params.get("db", None),
                                 params.get("value", None),
+                                params.get("track_type", "track"))
+                        elif command_type == "set_track_mute":
+                            result = self._set_track_switch(
+                                params.get("track_index", 0), "mute",
+                                params.get("mute", True),
+                                params.get("track_type", "track"))
+                        elif command_type == "set_track_solo":
+                            result = self._set_track_switch(
+                                params.get("track_index", 0), "solo",
+                                params.get("solo", True),
                                 params.get("track_type", "track"))
 
                         # Put the result in the queue
@@ -805,12 +822,16 @@ class AbletonMCP(ControlSurface):
                 entry["index"] = i
                 entry["name"] = send.name
                 sends.append(entry)
+            is_master = (track_type or "track").lower() == "master"
             return {
                 "name": track.name,
                 "track_type": (track_type or "track").lower(),
                 "volume": self._param_report(mixer.volume),
                 "panning": self._param_report(mixer.panning),
                 "sends": sends,
+                # The master track has no mute or solo.
+                "mute": None if is_master else bool(track.mute),
+                "solo": None if is_master else bool(track.solo),
             }
         except Exception as e:
             self.log_message("Error getting mixer: " + str(e))
@@ -856,6 +877,18 @@ class AbletonMCP(ControlSurface):
             return result
         except Exception as e:
             self.log_message("Error setting send: " + str(e))
+            raise
+
+    def _set_track_switch(self, track_index, attr, on, track_type="track"):
+        """Set a track's mute or solo button (attr is "mute" or "solo")."""
+        try:
+            if (track_type or "track").lower() == "master":
+                raise Exception("The master track has no %s" % attr)
+            track = self._resolve_track(track_index, track_type)
+            setattr(track, attr, bool(on))
+            return {"name": track.name, attr: bool(getattr(track, attr))}
+        except Exception as e:
+            self.log_message("Error setting track %s: %s" % (attr, str(e)))
             raise
 
     def _set_track_name(self, track_index, name):

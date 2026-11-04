@@ -115,6 +115,9 @@ class RawOps:
     def clear_notes(self, t, s):
         return self.c.send("clear_notes_from_clip", {"track_index": t, "clip_index": s})
 
+    def get_track_info(self, t):
+        return self.c.send("get_track_info", {"track_index": t})
+
 
 class ServerOps:
     """Selftest steps through the MCP server's tool functions, in-process.
@@ -160,6 +163,16 @@ class ServerOps:
         if not out.startswith("Cleared"):
             raise CommandError(out)
         return {"message": out}
+
+    def get_track_info(self, t):
+        return self._json(self._call(self.server.get_track_info, t))
+
+    @staticmethod
+    def _json(out):
+        try:
+            return json.loads(out)
+        except ValueError:
+            raise CommandError(out)
 
 
 def find_or_create_selftest_track(client: Client) -> int:
@@ -213,11 +226,61 @@ def cmd_selftest_notes(client: Client, via_server: bool) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# selftest-connection: large multi-byte replies, then recovery after an error
+# --------------------------------------------------------------------------
+
+def cmd_selftest_connection(client: Client, via_server: bool) -> int:
+    ops = ServerOps() if via_server else RawOps(client)
+    track = find_or_create_selftest_track(client)
+    print(f"selftest-connection via {ops.label}: track {track} ({SELFTEST_TRACK!r})")
+    failures = 0
+    try:
+        # >8 KiB of 2- and 4-byte characters, at both byte parities, so a
+        # recv() boundary lands inside a character on at least one of them.
+        for label, name in (("2-byte, even", "é" * 5000),
+                            ("2-byte, odd", "x" + "é" * 5000),
+                            ("4-byte", "🥁" * 2500)):
+            client.send("set_track_name", {"track_index": track, "name": name})
+            expected = client.send("get_track_info", {"track_index": track})["name"]
+            got = ops.get_track_info(track)["name"]
+            size = len(expected.encode("utf-8"))
+            if got == expected and size > 8192:
+                print(f"  multi-byte reply       ok ({label}, name {size} bytes)")
+            else:
+                print(f"  multi-byte reply       FAIL ({label}: got {len(got)} chars, "
+                      f"expected {len(expected)}, {size} bytes)")
+                failures += 1
+
+        try:
+            ops.get_track_info(9999)
+            print("  error reply            FAIL (track 9999 did not error)")
+            failures += 1
+        except CommandError as e:
+            print(f"  error reply            ok ({e})")
+        if ops.get_track_info(track)["index"] == track:
+            print("  command after error    ok (reconnected)")
+    except CommandError as e:
+        print(f"FAIL: {e}")
+        failures += 1
+    finally:
+        client.send("set_track_name", {"track_index": track, "name": SELFTEST_TRACK})
+
+    print("PASS" if not failures else f"FAIL ({failures})")
+    return 1 if failures else 0
+
+
+SELFTESTS = {
+    "selftest-notes": cmd_selftest_notes,
+    "selftest-connection": cmd_selftest_connection,
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Send commands straight to the AbletonMCP Remote Script socket.",
     )
-    parser.add_argument("command", help="ping | selftest-notes | any Remote Script command type")
+    parser.add_argument("command", help="ping | " + " | ".join(SELFTESTS) + " | any Remote Script command type")
     parser.add_argument("params", nargs="*", help="JSON object or key=value pairs")
     parser.add_argument("--via-server", action="store_true",
                         help="selftest-notes: drive the note steps through MCP_Server tool functions")
@@ -235,8 +298,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "ping":
             return cmd_ping(client)
-        if args.command == "selftest-notes":
-            return cmd_selftest_notes(client, args.via_server)
+        if args.command in SELFTESTS:
+            return SELFTESTS[args.command](client, args.via_server)
         result = client.send(args.command, parse_params(args.params))
         print(json.dumps(result, indent=2))
         return 0

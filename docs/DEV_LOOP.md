@@ -6,8 +6,10 @@ from it into Live's User Library, so code changes take effect without publishing
 ## Day to day
 
 ```powershell
-# 1. Remote Script changed? Install it, then re-select AbletonMCP in Live
-#    (Settings > Link, Tempo & MIDI > Control Surface) or restart Live.
+# 1. Remote Script changed? Install it, then quit and restart Live.
+#    Re-selecting AbletonMCP under Control Surface does NOT reload the code:
+#    Live keeps the imported module and only re-instantiates the old class.
+#    `ableton_cli.py ping` lists capabilities, so you can confirm the reload.
 powershell -ExecutionPolicy Bypass -File scripts\dev_install.ps1
 
 # 2. Test against Live directly (no Claude Desktop needed).

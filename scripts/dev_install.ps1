@@ -12,8 +12,9 @@
       3. installs the new __init__.py, removes the stale __pycache__, and
          verifies the bytes on disk match.
 
-    Afterwards, restart Live or re-select AbletonMCP under
-    Settings > Link, Tempo & MIDI > Control Surface.
+    Afterwards, quit and restart Live. Re-selecting AbletonMCP under Control
+    Surface is not enough: Live keeps the already-imported module and only
+    re-instantiates the old class.
 
 .PARAMETER UserLibrary
     Ableton User Library folder. Defaults to <Documents>\Ableton\User Library,
@@ -78,4 +79,4 @@ if ($attrs -band 0x400000) {
 }
 
 Write-Host "installed AbletonMCP Remote Script v$version -> $dest"
-Write-Host "Next: restart Live, or re-select AbletonMCP in Settings > Link, Tempo & MIDI > Control Surface."
+Write-Host "Next: quit and restart Live (re-selecting the Control Surface does not reload the code)."

@@ -757,6 +757,50 @@ def set_track_name(ctx: Context, track_index: int, name: str, user_prompt: str =
         logger.error(f"Error setting track name: {str(e)}")
         return f"Error setting track name: {str(e)}"
 
+# ── Saving the Set (Windows UI automation) ─────────────────────────────────────
+
+@mcp.tool()
+@telemetry_tool("save_set")
+def save_set(
+    ctx: Context,
+    folder: Optional[str] = None,
+    filename: Optional[str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Save the open Live Set (Windows only). Live's API has no save, so this
+    brings Live's window to the front and uses Live's own Save command.
+
+    - No arguments: Ctrl+S. The Set must already have a file; a new
+      "Untitled" Set is refused.
+    - folder + filename: Save As a new file, e.g. folder="C:\\Users\\me\\Music",
+      filename="My Track". Live usually creates "My Track Project\\My Track.als"
+      inside that folder. An existing file is never overwritten.
+
+    The save is verified (file on disk, unsaved-changes marker gone) and an
+    error is returned on anything unexpected; no keys are ever sent to a
+    window other than Live's. Exporting audio stays manual (File > Export).
+
+    Parameters:
+    - folder: Absolute folder for Save As (give with filename)
+    - filename: Set name for Save As, without or with .als
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .save_set import SaveError, save_set as _save
+
+        try:
+            result = _save(folder, filename)
+        except SaveError as e:
+            return f"Error saving Set: {e}"
+        where = f" to {result['path']}" if result.get("path") else ""
+        note = f" ({result['note']})" if result.get("note") else ""
+        return f"Saved Set '{result['set']}'{where}{note}"
+    except Exception as e:
+        logger.error(f"Error saving Set: {str(e)}")
+        return f"Error saving Set: {str(e)}"
+
+
 # ── Level measurement ──────────────────────────────────────────────────────────
 
 import time as _time

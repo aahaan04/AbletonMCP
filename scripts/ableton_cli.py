@@ -1079,6 +1079,49 @@ def cmd_selftest_groovefix(client: Client, via_server: bool) -> int:
     return c.finish()
 
 
+SAVE_FOLDER = os.environ.get("ABLETON_CLI_SAVE_FOLDER", "")
+SAVE_NAME = "ableton_cli save test"
+
+
+def cmd_selftest_save(client: Client, via_server: bool) -> int:
+    """save_set is a server-side tool (Windows UI automation); both modes call
+    it through the server. Needs ABLETON_CLI_SAVE_FOLDER and an Untitled Set.
+    It sends Ctrl+S / Ctrl+Shift+S to Live and leaves the saved file behind."""
+    server = ServerOps()
+    c = Checker()
+    from MCP_Server.save_set import find_live_window, parse_title
+    if not SAVE_FOLDER:
+        print("selftest-save: set ABLETON_CLI_SAVE_FOLDER to an existing folder first")
+        return 2
+    name, dirty = parse_title(find_live_window()[2])
+    if name != "Untitled":
+        print(f"selftest-save: the open Set is already saved as {name!r}; run it on a new Set")
+        return 2
+    print(f"selftest-save (server-side tool, both modes): Save As into {SAVE_FOLDER}")
+    try:
+        out = server.run("save_set", folder=SAVE_FOLDER, filename=SAVE_NAME)["message"]
+        title = find_live_window()[2]
+        path = out.split(" to ", 1)[-1] if " to " in out else ""
+        c.check("Save As", out.startswith("Saved") and parse_title(title) == (SAVE_NAME, False)
+                and os.path.exists(path), path or out)
+
+        with temp_track(client, "ableton_cli dirty"):
+            pass                                   # create + delete: Set now has unsaved changes
+        time.sleep(0.3)
+        c.check("change marks Set dirty", parse_title(find_live_window()[2])[1])
+        out = server.run("save_set")["message"]
+        c.check("Save (Ctrl+S)", out.startswith("Saved") and not parse_title(find_live_window()[2])[1], out)
+
+        try:
+            server.run("save_set", folder=SAVE_FOLDER, filename=SAVE_NAME)
+            c.check("existing name refused", False, "overwrote")
+        except CommandError as e:
+            c.check("existing name refused", "already exists" in str(e))
+    except CommandError as e:
+        c.check("save commands", False, str(e))
+    return c.finish()
+
+
 SELFTESTS = {
     "selftest-notes": cmd_selftest_notes,
     "selftest-connection": cmd_selftest_connection,
@@ -1096,6 +1139,7 @@ SELFTESTS = {
     "selftest-levels": cmd_selftest_levels,
     "selftest-search": cmd_selftest_search,
     "selftest-groovefix": cmd_selftest_groovefix,
+    "selftest-save": cmd_selftest_save,
 }
 
 

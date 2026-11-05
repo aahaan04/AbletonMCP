@@ -28,7 +28,8 @@ uv run --with pytest pytest -q
 ```
 
 MCP server changed? Quit Claude Desktop fully (tray icon > Quit) and reopen it;
-it starts a fresh `uv run ableton-mcp` from this checkout.
+it starts a fresh `uv run ableton-mcp` from this checkout. See
+[Keeping Claude Desktop current](#keeping-claude-desktop-current).
 
 Remote Script changed? Always go through `dev_install.ps1` (it syncs the bundled
 copy *and* installs into Live); copying into the bundle alone does not reach Live.
@@ -102,6 +103,39 @@ Upstream PRs usually edit only `AbletonMCP_Remote_Script/__init__.py`; run
 `UV_PYTHON_INSTALL_DIR` keeps uv's managed Python outside `%APPDATA%`. Claude
 Desktop is a packaged (MSIX) app, so its writes under `%APPDATA%` are redirected
 into a private folder, which breaks the directory link uv creates there.
+
+## Keeping Claude Desktop current
+
+`C:\Users\aahaa\dev\AbletonMCP` is the only checkout. Claude Desktop runs it,
+and all development happens in it on `dev`. Don't create other clones or
+worktrees for this repo. The `.venv` is an editable install that points at
+`MCP_Server\` here, so a commit takes effect as soon as the server restarts.
+`uv sync` is needed only when `pyproject.toml` dependencies change.
+
+Claude Desktop starts the server **once, when the app starts**, and keeps that
+process and its tool list until the app is fully quit. Closing the window only
+hides the app in the tray, and a new chat reuses the same server. After any
+change under `MCP_Server\`, the app's server runs old code (old tools, old
+`EXPECTED_REMOTE_SCRIPT_VERSION`) until you choose **tray icon > Quit** and
+reopen the app. On Day 5 this showed up as Claude Desktop expecting Remote
+Script 1.10.0 with none of the new tools, while Live already had 1.11.1 loaded.
+
+After pulling or committing server code, and before an end-to-end run from
+Claude Desktop:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\check_fresh.ps1
+```
+
+It warns, and exits 1, when any of these is true:
+- the checkout isn't on `dev`;
+- the checkout has uncommitted changes;
+- the checkout differs from `origin/dev`;
+- a running `ableton-mcp` server started before the newest `MCP_Server\*.py` change.
+
+It also prints the Remote Script version the server expects. Then
+`get_remote_script_info` from Claude Desktop should report that same version
+for both the server and Live.
 
 ## Versioning
 

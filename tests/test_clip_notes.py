@@ -48,6 +48,11 @@ class FakeConnection:
         self.sent = []  # list of (command_type, params) tuples
 
     def send_command(self, command_type, params=None):
+        if command_type == "get_track_info" and self.raise_exc is None:
+            # Note-writing tools read the clip's length first.
+            return {"clip_slots": [{"index": i, "has_clip": True,
+                                    "clip": {"name": "Clip", "length": 16.0, "groove": None}}
+                                   for i in range(8)]}
         self.sent.append((command_type, params or {}))
         if self.raise_exc is not None:
             raise self.raise_exc
@@ -77,12 +82,10 @@ def _silence_telemetry(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_consent_prompt(monkeypatch):
-    """A tool result gets the dataset-consent question appended while the user
-    has never been asked. That depends on the developer's own ~/.ableton-mcp
-    state, and it would corrupt the JSON these tests parse. Pin it off."""
-    import MCP_Server.dataset.consent as consent
-    monkeypatch.setattr(consent, "maybe_consent_notice", lambda: "")
+def _no_consent_prompt():
+    """Kept as a no-op so test modules that import it keep working: tool
+    results no longer carry a consent prompt (see test_consent.py)."""
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -91,7 +94,7 @@ def _script_capabilities_available(monkeypatch):
     handshake. Report every capability as present so the tests exercise the
     tool body rather than the missing-script early return."""
     import MCP_Server.script_handshake as sh
-    monkeypatch.setattr(sh, "require_capability", lambda name: None)
+    monkeypatch.setattr(sh, "require_capability", lambda name, send_command=None: None)
 
 
 # A representative clip payload as the Remote Script would return it.
@@ -147,7 +150,9 @@ def test_read_output_feeds_straight_into_add_notes(fake_conn):
     conn.response = {"note_count": len(notes)}
     call(server.add_notes_to_clip, None, 0, 0, notes)
     written = [c for c in conn.sent if c[0] == "add_notes_to_clip"][0][1]["notes"]
-    assert written == SAMPLE_NOTES
+    # note_id is read-only metadata; everything that defines the note survives.
+    keys = ("pitch", "start_time", "duration", "velocity", "mute")
+    assert written == [{k: n[k] for k in keys} for n in SAMPLE_NOTES]
 
 
 def test_add_notes_forwards_track_clip_and_notes(fake_conn):

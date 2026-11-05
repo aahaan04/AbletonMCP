@@ -38,6 +38,28 @@ MODIFYING_TOOLS = {
     "load_instrument_or_effect",
     "load_drum_kit",
     "duplicate_to_arrangement",
+    "set_track_volume",
+    "set_track_panning",
+    "set_send",
+    "set_track_mute",
+    "set_track_solo",
+    "set_nested_device_parameter",
+    "create_return_track",
+    "write_clip_automation",
+    "clear_clip_automation",
+    "fill_arrangement",
+    "fill_arrangement_section",
+    "set_arrangement_loop",
+    "set_locator",
+    "delete_locator",
+    "modify_notes",
+    "delete_notes",
+    "load_groove",
+    "assign_groove",
+    "set_groove_amount",
+    "set_groove_params",
+    "write_drum_pattern",
+    "clear_clip_groove",
 }
 
 _PARAM_KEYS = (
@@ -221,55 +243,6 @@ def _extract_params(kwargs: dict) -> dict[str, Any]:
     return params
 
 
-async def _try_elicit(kwargs: dict) -> bool:
-    """Ask for consent through the client. True if the user actually answered.
-
-    False means fall back to the text notice — either the client cannot render
-    a dialog, or there was no ctx to render it through.
-    """
-    ctx = kwargs.get("ctx")
-    if ctx is None:
-        return False
-    try:
-        from .consent import UNKNOWN, try_elicit_consent
-
-        state = await try_elicit_consent(ctx)
-    except Exception as e:
-        logger.debug("Consent elicitation failed: %s", e)
-        return False
-    if state is None:
-        return False
-    if state == UNKNOWN:
-        # Dialog shown but dismissed; do not also nag with the text prompt
-        return True
-    try:
-        from ..telemetry import refresh_consent_from_dataset
-
-        refresh_consent_from_dataset()
-    except Exception as e:
-        logger.debug("Could not refresh telemetry consent: %s", e)
-    return True
-
-
-def _with_consent_notice(result: Any) -> Any:
-    """Append the one-time consent question to a tool result.
-
-    Only string results are touched, and only when the user has never been
-    asked. Any failure here is swallowed: the consent prompt must never be the
-    reason a tool call breaks.
-    """
-    if not isinstance(result, str):
-        return result
-    try:
-        from .consent import maybe_consent_notice
-
-        notice = maybe_consent_notice()
-    except Exception as e:
-        logger.debug("Consent notice unavailable: %s", e)
-        return result
-    return result + notice if notice else result
-
-
 def _safe_get_recorder():
     """get_recorder() touches config/telemetry — never let that break a tool."""
     try:
@@ -447,25 +420,16 @@ def trajectory_tool(tool_name: str, modifying: bool | None = None):
                 return await func(*args, **kwargs)
             return func(*args, **kwargs)
 
-        # Always async, even around a sync tool. ctx.elicit is a coroutine, and
-        # a sync wrapper has no way to await it: FastMCP runs sync tools inside
-        # the running loop, so there is no loop to schedule on and no separate
-        # thread to hand off to. Since every tool in this server is sync, a
-        # sync wrapper meant the client dialog could never be shown at all and
-        # consent silently fell back to the text notice. functools.wraps keeps
-        # the signature, so FastMCP still injects ctx and derives the same
-        # schema (ctx excluded) — being async is invisible to the client.
+        # Always async, even around a sync tool (it used to await a consent
+        # dialog; callers and tests now rely on decorated tools being
+        # coroutines). functools.wraps keeps the signature, so FastMCP still
+        # injects ctx and derives the same schema — invisible to the client.
         @functools.wraps(func)
         async def wrapper(*args, **kwargs) -> Any:
             recorder = _safe_get_recorder()
             if recorder is None:
-                result = await _call(*args, **kwargs)
-                # Prefer a real client dialog; fall back to the text prompt
-                if await _try_elicit(kwargs):
-                    recorder = _safe_get_recorder()
-                    if recorder is not None:
-                        return result
-                return _with_consent_notice(result)
+                # Recording off (the default): run the tool, add nothing to its result.
+                return await _call(*args, **kwargs)
 
             pre_hash, pre_hash_source, start = _begin(recorder, kwargs)
             success, error = False, None

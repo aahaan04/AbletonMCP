@@ -1,0 +1,1255 @@
+"""Talk to the AbletonMCP Remote Script directly over its TCP socket.
+
+Bypasses Claude Desktop and the MCP server so Remote Script features can be
+tested on their own. Stdlib only, so plain `python` works; --via-server needs
+the project env (`uv run`).
+
+Every selftest builds what it needs on throwaway tracks/returns/devices and
+deletes them again, so the open Set is left as it was found.
+
+Examples (from the repo root):
+    python scripts/ableton_cli.py ping
+    python scripts/ableton_cli.py get_track_info track_index=0
+    python scripts/ableton_cli.py add_notes_to_clip '{"track_index":0,"clip_index":0,"notes":[...]}'
+    python scripts/ableton_cli.py selftest-notes
+    uv run python scripts/ableton_cli.py selftest-notes --via-server
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+HOST = os.environ.get("ABLETON_HOST", "127.0.0.1")
+PORT = int(os.environ.get("ABLETON_PORT", "9877"))
+TEMP_TRACK = "ableton_cli temp"
+DRUM_KIT = "808 Core Kit.adg"
+SELFTEST_NOTES = [
+    {"pitch": 60, "start_time": 0.0, "duration": 0.5, "velocity": 100, "mute": False},
+    {"pitch": 64, "start_time": 1.0, "duration": 0.5, "velocity": 90, "mute": False},
+    {"pitch": 67, "start_time": 2.0, "duration": 1.0, "velocity": 80, "mute": False},
+]
+
+
+class CommandError(Exception):
+    """The Remote Script answered with status=error."""
+
+
+class Client:
+    def __init__(self, host: str = HOST, port: int = PORT, timeout: float = 15.0):
+        self.sock = socket.create_connection((host, port), timeout=5.0)
+        self.sock.settimeout(timeout)
+
+    def close(self) -> None:
+        self.sock.close()
+
+    def send(self, command_type: str, params: dict | None = None) -> dict:
+        payload = {"type": command_type, "params": params or {}}
+        self.sock.sendall(json.dumps(payload).encode("utf-8"))
+        # The protocol has no framing: one JSON object per reply, so read
+        # until the buffer parses.
+        buf = b""
+        while True:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("Remote Script closed the connection")
+            buf += chunk
+            try:
+                response = json.loads(buf.decode("utf-8"))
+                break
+            except (ValueError, UnicodeDecodeError):
+                continue
+        if response.get("status") == "error":
+            raise CommandError(response.get("message", "unknown error"))
+        return response.get("result", {})
+
+
+def parse_params(args: list[str]) -> dict:
+    """Accept either one JSON object or key=value pairs (values JSON-decoded
+    when possible, so track_index=0 is an int and name=Bass a string)."""
+    if not args:
+        return {}
+    if len(args) == 1 and args[0].lstrip().startswith("{"):
+        return json.loads(args[0])
+    params = {}
+    for arg in args:
+        key, sep, value = arg.partition("=")
+        if not sep:
+            raise SystemExit(f"Expected key=value or a JSON object, got {arg!r}")
+        try:
+            params[key] = json.loads(value)
+        except ValueError:
+            params[key] = value
+    return params
+
+
+def cmd_ping(client: Client) -> int:
+    info = client.send("get_script_info")
+    print(f"Remote Script v{info.get('script_version')} "
+          f"(protocol {info.get('protocol_version')}, port {info.get('port')})")
+    print(f"capabilities ({len(info.get('capabilities', []))}): "
+          + ", ".join(info.get("capabilities", [])))
+    session = client.send("get_session_info")
+    print(json.dumps(session, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Two ways to drive a selftest step: raw socket, or the MCP server's tools
+# --------------------------------------------------------------------------
+
+class RawOps:
+    """Selftest steps straight over the socket, by Remote Script command name."""
+
+    label = "raw socket"
+
+    def __init__(self, client: Client):
+        self.c = client
+
+    def run(self, command, **params):
+        return self.c.send(command, params)
+
+    def load(self, track_index, uri, track_type="track"):
+        return self.run("load_browser_item", track_index=track_index, item_uri=uri,
+                        track_type=track_type)
+
+
+class ServerOps:
+    """Selftest steps through the MCP server's tool functions, in-process.
+
+    No handshake is run first: that is the state the server is in when it was
+    started before Live, which is what made clear_notes_from_clip refuse with
+    "missing capability" against an up-to-date Remote Script.
+    """
+
+    label = "MCP server tools"
+
+    def __init__(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        os.environ.setdefault("DISABLE_TELEMETRY", "1")
+        os.environ.setdefault("ABLETON_MCP_DISABLE_DATASET", "1")
+        import MCP_Server.server as server  # noqa: E402
+
+        self.server = server
+
+    def run(self, command, **params):
+        """The MCP tool of the same name. Tools that return prose are checked
+        for an error prefix; JSON is decoded."""
+        import asyncio
+        import inspect
+
+        out = getattr(self.server, command)(None, **params)
+        if inspect.iscoroutine(out):
+            out = asyncio.run(out)
+        if out.startswith(("Error", "Ableton Remote Script missing", "Failed")):
+            raise CommandError(out)
+        try:
+            return json.loads(out)
+        except ValueError:
+            return {"message": out}
+
+    def load(self, track_index, uri, track_type="track"):
+        return self.run("load_instrument_or_effect", track_index=track_index, uri=uri,
+                        track_type=track_type)
+
+
+def make_ops(client: Client, via_server: bool):
+    return ServerOps() if via_server else RawOps(client)
+
+
+class Checker:
+    def __init__(self):
+        self.failures = 0
+
+    def check(self, label, ok, detail=""):
+        print(f"  {label:<26} {'ok' if ok else 'FAIL'}{f' ({detail})' if detail else ''}")
+        if not ok:
+            self.failures += 1
+
+    def info(self, label, detail):
+        print(f"  {label:<26} -- ({detail})")
+
+    def finish(self):
+        print("PASS" if not self.failures else f"FAIL ({self.failures})")
+        return 1 if self.failures else 0
+
+
+def _close(a, b, tol):
+    return a is not None and abs(a - b) <= tol
+
+
+# --------------------------------------------------------------------------
+# Throwaway objects and browser lookups
+# --------------------------------------------------------------------------
+
+def track_names(client: Client) -> list[str]:
+    return [client.send("get_track_info", {"track_index": i})["name"]
+            for i in range(client.send("get_session_info")["track_count"])]
+
+
+@contextmanager
+def temp_track(client: Client, name: str = TEMP_TRACK):
+    """A MIDI track at the end of the set, deleted on exit by its name."""
+    index = client.send("create_midi_track", {"index": -1})["index"]
+    client.send("set_track_name", {"track_index": index, "name": name})
+    try:
+        yield index
+    finally:
+        try:
+            client.send("set_track_name", {"track_index": index, "name": name})
+            client.send("delete_track", {"track_index": index, "expected_name": name})
+        except CommandError as e:
+            print(f"  WARNING: could not delete temp track {index} ({e})")
+
+
+def browser_uri(client: Client, path: str, name: str) -> str:
+    items = client.send("get_browser_items_at_path", {"path": path})["items"]
+    hit = next((i for i in items if i["name"] == name), None)
+    if hit is None:
+        raise CommandError(f"{name!r} not found under browser path {path!r}")
+    return hit["uri"]
+
+
+def snapshot(client: Client) -> dict:
+    return client.send("get_session_snapshot", {"include_notes": False, "include_params": False})
+
+
+# --------------------------------------------------------------------------
+# selftest-notes: create clip -> add notes -> read -> clear -> read empty
+# --------------------------------------------------------------------------
+
+def cmd_selftest_notes(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    with temp_track(client) as track:
+        print(f"selftest-notes via {ops.label}: temp track {track}")
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+        try:
+            ops.run("add_notes_to_clip", track_index=track, clip_index=0, notes=SELFTEST_NOTES)
+            before = ops.run("get_clip_notes", track_index=track, clip_index=0)
+            c.check("add + read", before["note_count"] == len(SELFTEST_NOTES),
+                    f"{before['note_count']} notes")
+            cleared = ops.run("clear_notes_from_clip", track_index=track, clip_index=0)
+            c.check("clear", True, cleared.get("cleared_count", cleared.get("message")))
+            after = ops.run("get_clip_notes", track_index=track, clip_index=0)
+            c.check("read empty", after["note_count"] == 0 and after["notes"] == [], "notes == []")
+        except CommandError as e:
+            c.check("note commands", False, str(e))
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-connection: large multi-byte replies, then recovery after an error
+# --------------------------------------------------------------------------
+
+def cmd_selftest_connection(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    with temp_track(client) as track:
+        print(f"selftest-connection via {ops.label}: temp track {track}")
+        try:
+            # >8 KiB of 2- and 4-byte characters, at both byte parities, so a
+            # recv() boundary lands inside a character on at least one of them.
+            for label, name in (("2-byte, even", "é" * 5000),
+                                ("2-byte, odd", "x" + "é" * 5000),
+                                ("4-byte", "🥁" * 2500)):
+                client.send("set_track_name", {"track_index": track, "name": name})
+                expected = client.send("get_track_info", {"track_index": track})["name"]
+                got = ops.run("get_track_info", track_index=track)["name"]
+                size = len(expected.encode("utf-8"))
+                c.check(f"multi-byte reply {label}", got == expected and size > 8192, f"{size} bytes")
+            try:
+                ops.run("get_track_info", track_index=9999)
+                c.check("error reply", False, "track 9999 did not error")
+            except CommandError as e:
+                c.check("error reply", True, str(e))
+            c.check("command after error", ops.run("get_track_info", track_index=track)["index"] == track,
+                    "reconnected")
+        except CommandError as e:
+            c.check("connection commands", False, str(e))
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-mixer: volume, pan, mute, solo, send -> read back
+# --------------------------------------------------------------------------
+
+def cmd_selftest_mixer(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    returns = client.send("get_session_info")["return_track_count"]
+    with temp_track(client) as track:
+        print(f"selftest-mixer via {ops.label}: temp track {track}, {returns} return track(s)")
+        try:
+            ops.run("set_track_volume", track_index=track, db=-6.0)
+            ops.run("set_track_panning", track_index=track, value=0.5)
+            ops.run("set_track_mute", track_index=track, mute=True)
+            ops.run("set_track_solo", track_index=track, solo=True)
+            if returns:
+                ops.run("set_send", track_index=track, send_index=0, db=-12.0)
+            m = ops.run("get_mixer", track_index=track)
+            c.check("volume -6 dB", _close(m["volume"]["db"], -6.0, 0.05), m["volume"]["display"])
+            c.check("pan 0.5", _close(m["panning"]["value"], 0.5, 1e-3), m["panning"]["display"])
+            c.check("mute on", m["mute"] is True)
+            c.check("solo on", m["solo"] is True)
+            if returns:
+                s = m["sends"][0]
+                c.check("send A -12 dB", _close(s["db"], -12.0, 0.05), f"{s['name']}: {s['display']}")
+            else:
+                c.info("send", "skipped, no return tracks in this set")
+        except CommandError as e:
+            c.check("mixer commands", False, str(e))
+        finally:
+            # Unsolo before the track goes, so the rest of the set isn't left silenced.
+            client.send("set_track_solo", {"track_index": track, "solo": False})
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-drums: stock kit -> list pads -> change pad parameters -> read back
+# --------------------------------------------------------------------------
+
+def _pick_param(params, preferred):
+    """A writable, continuous parameter: the first preferred name present,
+    else the first non-'Device On' one."""
+    usable = [p for p in params if p["name"].strip() != "Device On"
+              and p.get("is_enabled", True) and p["max"] > p["min"]]
+    for name in preferred:
+        hit = next((p for p in usable if p["name"].strip() == name), None)
+        if hit:
+            return hit
+    return usable[0] if usable else None
+
+
+def _roundtrip_param(c, ops, label, address, preferred):
+    """Set a nested parameter to a new value, read it back."""
+    params = ops.run("get_nested_device_parameters", **address)["device"]["parameters"]
+    p = _pick_param(params, preferred)
+    if p is None:
+        c.check(label, False, "no writable parameter")
+        return
+    name, old = p["name"].strip(), p["value"]
+    new = p["min"] + (p["max"] - p["min"]) * (0.25 if old > (p["min"] + p["max"]) / 2 else 0.75)
+    if p.get("is_quantized"):
+        new = float(round(new))
+    ops.run("set_nested_device_parameter", value=new, parameter_name=name, **address)
+    back = next(q for q in ops.run("get_nested_device_parameters", **address)["device"]["parameters"]
+                if q["name"].strip() == name)
+    c.check(label, _close(back["value"], new, 1e-4), f"{name}: {old:g} -> {back['value']:g}")
+
+
+def cmd_selftest_drums(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    with temp_track(client) as track:
+        kit = browser_uri(client, "drums", DRUM_KIT)
+        client.send("load_browser_item", {"track_index": track, "item_uri": kit})
+        print(f"selftest-drums via {ops.label}: temp track {track} with {DRUM_KIT}")
+        try:
+            pads = ops.run("get_drum_pads", track_index=track)
+            listed = pads["pads"]
+            names_ok = all(p["note_name"] == f"{'C C# D D# E F F# G G# A A# B'.split()[p['note'] % 12]}"
+                                           f"{p['note'] // 12 - 2}" for p in listed)
+            c.check("get_drum_pads", pads["pad_count"] > 0 and names_ok,
+                    f"{pads['pad_count']} pads, "
+                    + ", ".join(f"{p['note']}={p['note_name']} {p['name']}" for p in listed[:3]) + ", ...")
+
+            pad = next((p for p in listed if p["note"] == 36), listed[0])
+            address = {"track_index": track, "device_index": pads["device_index"],
+                       "pad_note": pad["note"], "nested_device_index": 0}
+            _roundtrip_param(c, ops, "pad macro", address, ("Decay", "Tone"))
+            if pad["chains"][0]["devices"][0]["is_rack"]:
+                _roundtrip_param(c, ops, "pad sampler (path)", dict(address, path=[0, 0]),
+                                 ("Transpose", "Tune", "Decay"))
+
+            empty = next(n for n in range(36, 128) if n not in {p["note"] for p in listed})
+            try:
+                ops.run("get_nested_device_parameters", **dict(address, pad_note=empty))
+                c.check("empty pad refused", False, f"pad {empty} did not error")
+            except CommandError as e:
+                c.check("empty pad refused", "is empty" in str(e), str(e)[-30:])
+        except CommandError as e:
+            c.check("drum commands", False, str(e))
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-deletes: throwaway track with kit + clips and a return, delete all
+# --------------------------------------------------------------------------
+
+DELETE_TRACK = "ableton_cli delete me"
+
+
+def _refused(ops, command, **params):
+    try:
+        ops.run(command, **params)
+        return False
+    except CommandError as e:
+        return "Refusing to delete" in str(e)
+
+
+def cmd_selftest_deletes(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    track = client.send("create_midi_track", {"index": -1})["index"]
+    client.send("set_track_name", {"track_index": track, "name": DELETE_TRACK})
+    kit_name = DRUM_KIT[:-4]
+    client.send("load_browser_item", {"track_index": track, "item_uri": browser_uri(client, "drums", DRUM_KIT)})
+    client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+    client.send("duplicate_session_clip_to_arrangement",
+                {"track_index": track, "clip_index": 0, "destination_time": 0.0})
+    print(f"selftest-deletes via {ops.label}: track {track} ({DELETE_TRACK!r}) "
+          f"with {kit_name}, a session clip and an arrangement clip")
+
+    c = Checker()
+    try:
+        n = client.send("get_arrangement_clips", {"track_index": track})["clip_count"]
+        ops.run("delete_clip", track_index=track, clip_index=0, view="arrangement")
+        left = client.send("get_arrangement_clips", {"track_index": track})["clip_count"]
+        c.check("arrangement clip", n == 1 and left == 0, f"{n} -> {left}")
+
+        ops.run("delete_clip", track_index=track, clip_index=0)
+        slot = client.send("get_track_info", {"track_index": track})["clip_slots"][0]
+        c.check("session clip", not slot["has_clip"], "slot 0 empty")
+
+        pad_rack = {"track_index": track, "device_index": 0, "pad_note": 36, "nested_device_index": 0}
+        inner = lambda: client.send("get_nested_device_parameters", pad_rack)["device"]["chains"][0]["devices"]
+        before = [d["name"] for d in inner()]
+        ops.run("delete_nested_device", **dict(pad_rack, path=[0, 0]))
+        after = [d["name"] for d in inner()]
+        c.check("nested device", len(after) == len(before) - 1, f"{before} -> {after}")
+
+        c.check("wrong name refused", _refused(ops, "delete_device", track_index=track,
+                                               device_index=0, expected_name="Not The Kit"))
+        ops.run("delete_device", track_index=track, device_index=0, expected_name=kit_name)
+        devices = client.send("get_track_info", {"track_index": track})["devices"]
+        c.check("device", devices == [], f"{len(devices)} devices left")
+
+        returns = client.send("get_session_info")["return_track_count"]
+        created = client.send("create_return_track")
+        name, index = created["name"], created["return_track_index"]
+        c.check("return wrong name refused",
+                _refused(ops, "delete_return_track", return_index=index, expected_name="__nope__"))
+        ops.run("delete_return_track", return_index=index, expected_name=name)
+        left = client.send("get_session_info")["return_track_count"]
+        c.check("return track", left == returns, f"created {name!r}, {returns + 1} -> {left} returns")
+    except CommandError as e:
+        c.check("delete commands", False, str(e))
+    finally:
+        count = client.send("get_session_info")["track_count"]
+        ops.run("delete_track", track_index=track, expected_name=DELETE_TRACK)
+        names = track_names(client)
+        c.check("track", len(names) == count - 1 and DELETE_TRACK not in names,
+                f"{count} -> {len(names)} tracks")
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-returns: new return + Reverb, send to it, Limiter on master
+# --------------------------------------------------------------------------
+
+def cmd_selftest_returns(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    returns = client.send("get_session_info")["return_track_count"]
+    master_devices = len(snapshot(client)["master_track"]["devices"])
+    reverb = browser_uri(client, "audio_effects", "Reverb")
+    limiter = browser_uri(client, "audio_effects", "Limiter")
+    index = name = None
+    limiter_loaded = False
+    with temp_track(client) as track:
+        print(f"selftest-returns via {ops.label}: temp track {track}, {returns} returns, "
+              f"{master_devices} master devices")
+        try:
+            ops.run("create_return_track")
+            index = returns
+            name = client.send("get_mixer", {"track_index": index, "track_type": "return"})["name"]
+            c.check("create_return_track", client.send("get_session_info")["return_track_count"] == returns + 1,
+                    f"{name!r} at index {index}")
+
+            ops.load(index, reverb, "return")
+            ret = snapshot(client)["return_tracks"][index]
+            on_return = [d["name"] for d in ret["devices"]]
+            c.check("Reverb on return", on_return == ["Reverb"], str(on_return))
+            # Live renames an auto-named return after its first device ("C-Return" -> "C-Reverb").
+            name = ret["name"]
+
+            ops.run("set_send", track_index=track, send_index=index, db=-10.0)
+            s = client.send("get_mixer", {"track_index": track})["sends"][index]
+            c.check("send to new return", _close(s["db"], -10.0, 0.05) and s["name"] == name,
+                    f"{s['name']}: {s['display']}")
+
+            ops.load(0, limiter, "master")
+            limiter_loaded = True
+            on_master = [d["name"] for d in snapshot(client)["master_track"]["devices"]]
+            c.check("Limiter on master", len(on_master) == master_devices + 1 and on_master[-1] == "Limiter",
+                    str(on_master))
+        except CommandError as e:
+            c.check("return/master commands", False, str(e))
+        finally:
+            if limiter_loaded:
+                ops.run("delete_device", track_index=0, device_index=master_devices, track_type="master",
+                        expected_name="Limiter")
+            if name is not None:
+                ops.run("delete_return_track", return_index=index, expected_name=name)
+    snap = snapshot(client)
+    c.check("cleaned up", len(snap["return_tracks"]) == returns
+            and len(snap["master_track"]["devices"]) == master_devices,
+            f"{len(snap['return_tracks'])} returns, {len(snap['master_track']['devices'])} master devices")
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-automation: rising filter sweep + volume fade, read back, clear
+# --------------------------------------------------------------------------
+
+def cmd_selftest_automation(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    with temp_track(client) as track:
+        ops.load(track, browser_uri(client, "audio_effects", "Auto Filter"))
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 32.0})
+        params = client.send("get_device_parameters", {"track_index": track, "device_index": 0})
+        param = _pick_param(params["device"]["parameters"], ("Frequency",))
+        cutoff = {"device_index": 0, "parameter_name": param["name"].strip()}
+        lo, hi = param["min"], param["max"]
+        print(f"selftest-automation via {ops.label}: temp track {track}, Auto Filter "
+              f"{cutoff['parameter_name']} ({lo:g}..{hi:g}), 8-bar clip")
+        try:
+            ops.run("write_clip_automation", track_index=track, clip_index=0, target=cutoff,
+                    points=[{"time": 0, "normalized": 0.1}, {"time": 32, "normalized": 0.9}])
+            got = ops.run("get_clip_automation", track_index=track, clip_index=0, target=cutoff,
+                          times=[0, 8, 16, 24, 31.9])
+            vals = [s["value"] for s in got["samples"]]
+            expect = [lo + (hi - lo) * (0.1 + 0.8 * t / 32) for t in (0, 8, 16, 24, 31.9)]
+            tol = (hi - lo) * 0.02
+            c.check("cutoff sweep rises", got["has_envelope"] and vals == sorted(vals)
+                    and all(_close(v, e, tol) for v, e in zip(vals, expect)),
+                    ", ".join(s["display"] for s in got["samples"]))
+
+            ops.run("write_clip_automation", track_index=track, clip_index=0, target={"mixer": "volume"},
+                    points=[{"time": 0, "value": 0.85}, {"time": 16, "value": 0.0}])
+            vol = ops.run("get_clip_automation", track_index=track, clip_index=0,
+                          target={"mixer": "volume"}, times=[0, 8, 15.9, 24])
+            vv = [s["value"] for s in vol["samples"]]
+            c.check("volume fade falls", vv[0] > vv[1] > vv[2] >= vv[3] and _close(vv[3], 0.0, 1e-3),
+                    ", ".join(s["display"] for s in vol["samples"]))
+
+            ops.run("clear_clip_automation", track_index=track, clip_index=0, target=cutoff)
+            after = ops.run("get_clip_automation", track_index=track, clip_index=0, target=cutoff)
+            still = ops.run("get_clip_automation", track_index=track, clip_index=0, target={"mixer": "volume"})
+            c.check("clear one envelope", not after["has_envelope"] and still["has_envelope"],
+                    "cutoff gone, volume kept")
+            ops.run("clear_clip_automation", track_index=track, clip_index=0, all_parameters=True)
+            gone = ops.run("get_clip_automation", track_index=track, clip_index=0, target={"mixer": "volume"})
+            c.check("clear all envelopes", not gone["has_envelope"])
+
+            # Arrangement: report what Live allows rather than assume.
+            client.send("duplicate_session_clip_to_arrangement",
+                        {"track_index": track, "clip_index": 0, "destination_time": 0.0})
+            try:
+                ops.run("write_clip_automation", track_index=track, clip_index=0, target=cutoff,
+                        view="arrangement", points=[{"time": 0, "normalized": 0.2}, {"time": 8, "normalized": 0.8}])
+                arr = ops.run("get_clip_automation", track_index=track, clip_index=0, target=cutoff,
+                              view="arrangement", times=[0, 4, 7.9])
+                c.info("arrangement clip", "Live ALLOWED it: "
+                       + ", ".join(s["display"] for s in arr.get("samples", [])))
+            except CommandError as e:
+                c.info("arrangement clip", f"Live refused: {str(e)[-90:]}")
+        except CommandError as e:
+            c.check("automation commands", False, str(e))
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-meters: kick loop playing -> meters up; stopped -> meters down
+# --------------------------------------------------------------------------
+
+def _peak_meters(ops, track, seconds=1.0, every=0.1):
+    """Highest track and master output_meter_level seen over a short window."""
+    t_peak = m_peak = 0.0
+    end = time.time() + seconds
+    while time.time() < end:
+        t = ops.run("get_track_info", track_index=track).get("output_meter_level")
+        m = ops.run("get_session_info")["master_track"].get("output_meter_level")
+        if t is None or m is None:
+            raise CommandError("output_meter_level missing from track/session info")
+        t_peak, m_peak = max(t_peak, t), max(m_peak, m)
+        time.sleep(every)
+    return t_peak, m_peak
+
+
+def _wait_for_silence(ops, track, timeout=5.0, threshold=0.01):
+    """Seconds until both meters fall below threshold (Live holds the last
+    peak for up to ~1 s after stopping), or None on timeout."""
+    start = time.time()
+    while time.time() - start < timeout:
+        t = ops.run("get_track_info", track_index=track).get("output_meter_level") or 0.0
+        m = ops.run("get_session_info")["master_track"].get("output_meter_level") or 0.0
+        if t < threshold and m < threshold:
+            return time.time() - start
+        time.sleep(0.1)
+    return None
+
+
+def cmd_selftest_meters(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    with temp_track(client) as track:
+        client.send("load_browser_item", {"track_index": track, "item_uri": browser_uri(client, "drums", DRUM_KIT)})
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+        kicks = [{"pitch": 36, "start_time": float(b), "duration": 0.25, "velocity": 127, "mute": False}
+                 for b in range(4)]
+        client.send("add_notes_to_clip", {"track_index": track, "clip_index": 0, "notes": kicks})
+        print(f"selftest-meters via {ops.label}: temp track {track}, kick on every beat")
+        quiet_t = quiet_m = 0.0
+        try:
+            quiet_t, quiet_m = _peak_meters(ops, track, 0.5)
+            ops.run("fire_clip", track_index=track, clip_index=0)
+            time.sleep(2.5)  # global launch quantization is 1 bar (2 s at 120 BPM)
+            play_t, play_m = _peak_meters(ops, track, 1.5)
+            c.check("track meter while playing", play_t > 0.05, f"peak {play_t:.3f}")
+            c.check("master meter while playing", play_m > 0.05, f"peak {play_m:.3f}")
+        except CommandError as e:
+            c.check("meter commands", False, str(e))
+        finally:
+            client.send("stop_clip", {"track_index": track, "clip_index": 0})
+            client.send("stop_playback")
+        try:
+            silent_after = _wait_for_silence(ops, track)
+            playing = ops.run("get_session_info")["is_playing"]
+            c.check("transport stopped", playing is False)
+            c.check("meters fall to ~0", silent_after is not None,
+                    "timed out after 5 s" if silent_after is None else f"< 0.01 after {silent_after:.1f} s")
+            stop_t, stop_m = _peak_meters(ops, track, 0.5)
+            c.check("meters stay at ~0", stop_t < 0.01 and stop_m < 0.01,
+                    f"track {stop_t:.4f}, master {stop_m:.4f} (before play {quiet_t:.4f}, {quiet_m:.4f})")
+        except CommandError as e:
+            c.check("meter commands", False, str(e))
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-arrangement: 3-section layout on two tracks, envelope carried,
+# loop and locators, read back, refusals
+# --------------------------------------------------------------------------
+
+def _raw_toggle_locator(client: Client, beat: float):
+    """What the server's set_locator/delete_locator do: playhead move, then
+    toggle, as separate commands so Live applies the move in between."""
+    restore = client.send("get_session_info")["current_song_time"]
+    client.send("set_current_song_time", {"time": beat})
+    time.sleep(0.15)
+    try:
+        playhead = client.send("toggle_cue_at_playhead")["playhead"]
+        if abs(playhead - beat) > 0.01:
+            raise CommandError(f"cue toggled at beat {playhead}, not {beat}")
+        time.sleep(0.15)
+    finally:
+        client.send("set_current_song_time", {"time": restore})
+
+
+def set_locator(client: Client, ops, via_server: bool, name: str, bar: float):
+    if via_server:
+        return ops.run("set_locator", name=name, bar=bar)
+    beat = (bar - 1) * client.send("get_locators")["beats_per_bar"]
+    _raw_toggle_locator(client, beat)
+    return client.send("rename_locator", {"time": beat, "name": name})
+
+
+def delete_locator(client: Client, ops, via_server: bool, bar: float, name: str):
+    if via_server:
+        return ops.run("delete_locator", bar=bar, expected_name=name)
+    beat = (bar - 1) * client.send("get_locators")["beats_per_bar"]
+    cue = next((c for c in client.send("get_locators")["locators"] if abs(c["time"] - beat) < 0.01), None)
+    if cue is None or cue["name"] != name:
+        raise CommandError(f"no locator {name!r} at bar {bar}")
+    _raw_toggle_locator(client, beat)
+
+
+SECTIONS = (("ableton_cli Intro", 1, 8), ("ableton_cli Main", 9, 16), ("ableton_cli Outro", 17, 24))
+
+
+def cmd_selftest_arrangement(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    before = client.send("get_arrangement_layout", {"track_indexes": []})
+    bpb = before["beats_per_bar"]
+    taken = {l["bar"] for l in before["locators"]}
+    if any(float(bar) in taken for _, bar, _ in SECTIONS):
+        print("selftest-arrangement: a locator already sits at bar 1, 9 or 17; not touching it")
+        return 1
+    loop0 = before["loop"]
+    placed_locators = []
+    with temp_track(client, "ableton_cli temp A") as a, temp_track(client, "ableton_cli temp B") as b:
+        # A: 2-bar intro, 4-bar main, 2-bar outro. B: 4-bar intro with a filter sweep, 2-bar main.
+        for slot, bars, name in ((0, 2, "intro A"), (1, 4, "main A"), (2, 2, "outro A")):
+            client.send("create_clip", {"track_index": a, "clip_index": slot, "length": bars * bpb})
+            client.send("set_clip_name", {"track_index": a, "clip_index": slot, "name": name})
+        for slot, bars, name in ((0, 4, "intro B"), (1, 2, "main B")):
+            client.send("create_clip", {"track_index": b, "clip_index": slot, "length": bars * bpb})
+            client.send("set_clip_name", {"track_index": b, "clip_index": slot, "name": name})
+        client.send("load_browser_item", {"track_index": b, "item_uri": browser_uri(client, "audio_effects", "Auto Filter")})
+        freq = _pick_param(client.send("get_device_parameters", {"track_index": b, "device_index": 0})
+                           ["device"]["parameters"], ("Frequency",))
+        cutoff = {"device_index": 0, "parameter_name": freq["name"].strip()}
+        client.send("write_clip_automation", {"track_index": b, "clip_index": 0, "target": cutoff,
+                                              "points": [{"time": 0, "normalized": 0.2},
+                                                         {"time": 4 * bpb, "normalized": 0.8}]})
+        print(f"selftest-arrangement via {ops.label}: temp tracks {a} and {b}, "
+              f"sections bars 1-8 / 9-16 / 17-24")
+        try:
+            ops.run("fill_arrangement_section", start_bar=1, end_bar=8,
+                    placements=[{"track_index": a, "clip_index": 0}, {"track_index": b, "clip_index": 0}])
+            ops.run("fill_arrangement_section", start_bar=9, end_bar=16,
+                    placements=[{"track_index": a, "clip_index": 1}, {"track_index": b, "clip_index": 1}])
+            ops.run("fill_arrangement", track_index=a, clip_index=2, start_bar=17, end_bar=24)
+
+            layout = ops.run("get_arrangement_layout", track_indexes=[a, b])
+            ta, tb = layout["tracks"]
+            got_a = [(cl["name"], cl["start_bar"], cl["end_bar"]) for cl in ta["clips"]]
+            got_b = [(cl["name"], cl["start_bar"], cl["end_bar"]) for cl in tb["clips"]]
+            want_a = ([("intro A", s, s + 1) for s in (1, 3, 5, 7)] + [("main A", s, s + 3) for s in (9, 13)]
+                      + [("outro A", s, s + 1) for s in (17, 19, 21, 23)])
+            want_b = [("intro B", s, s + 3) for s in (1, 5)] + [("main B", s, s + 1) for s in (9, 11, 13, 15)]
+            c.check("track A positions", got_a == want_a and not ta["gaps"] and not ta["overlaps"],
+                    f"{len(got_a)} clips, bars {got_a[0][1]:g}-{got_a[-1][2]:g}")
+            c.check("track B positions", got_b == want_b and not tb["gaps"] and not tb["overlaps"],
+                    f"{len(got_b)} clips, bars {got_b[0][1]:g}-{got_b[-1][2]:g}")
+
+            # Live hides Arrangement clips' envelopes from the API, so prove the
+            # envelope came across by playing B's second intro copy (bars 5-8,
+            # cutoff 0.2 -> 0.8) soloed, and watching the parameter move.
+            vals = []
+            restore = client.send("get_session_info")["current_song_time"]
+            client.send("set_track_solo", {"track_index": b, "solo": True})
+            try:
+                client.send("set_current_song_time", {"time": 4 * bpb})
+                client.send("start_playback")
+                for _ in range(5):
+                    time.sleep(0.6)
+                    params = client.send("get_device_parameters", {"track_index": b, "device_index": 0})
+                    vals.append(next(p["value"] for p in params["device"]["parameters"]
+                                     if p["name"].strip() == cutoff["parameter_name"]))
+            finally:
+                client.send("stop_playback")
+                client.send("set_track_solo", {"track_index": b, "solo": False})
+                client.send("set_current_song_time", {"time": restore})
+            c.check("envelope plays in arrangement", vals == sorted(vals) and vals[-1] - vals[0] > 0.1
+                    and 0.19 < vals[0] and vals[-1] < 0.81, ", ".join(f"{v:.2f}" for v in vals))
+
+            try:
+                ops.run("fill_arrangement", track_index=a, clip_index=0, start_bar=9, end_bar=10)
+                c.check("occupied range refused", False, "placed over main A")
+            except CommandError as e:
+                c.check("occupied range refused", "already has clips" in str(e))
+            try:
+                ops.run("fill_arrangement", track_index=b, clip_index=0, start_bar=25, end_bar=30)
+                c.check("partial repeat refused", False, "placed 6 bars of a 4-bar clip")
+            except CommandError as e:
+                c.check("partial repeat refused", "whole number of repeats" in str(e))
+
+            for name, bar, _ in SECTIONS:
+                set_locator(client, ops, via_server, name, bar)
+                placed_locators.append((bar, name))
+            ops.run("set_arrangement_loop", start_bar=9, end_bar=16)
+            layout = ops.run("get_arrangement_layout", track_indexes=[])
+            locs = {(l["name"], l["bar"]) for l in layout["locators"]}
+            c.check("locators", all((n, float(bar)) in locs for n, bar, _ in SECTIONS),
+                    ", ".join(f"{n.split()[-1]}@{bar}" for n, bar, _ in SECTIONS))
+            lp = layout["loop"]
+            c.check("loop bars 9-16", lp["enabled"] and (lp["start_bar"], lp["end_bar"]) == (9, 16),
+                    f"{lp['start_bar']:g}-{lp['end_bar']:g}")
+        except CommandError as e:
+            c.check("arrangement commands", False, str(e))
+        finally:
+            for bar, name in reversed(placed_locators):
+                delete_locator(client, ops, via_server, bar, name)
+            client.send("set_arrangement_loop", {"start_bar": loop0["start_bar"], "end_bar": loop0["end_bar"],
+                                                 "enabled": loop0["enabled"]})
+    after = client.send("get_arrangement_layout", {"track_indexes": []})
+    c.check("cleaned up", after["locators"] == before["locators"] and after["loop"] == loop0,
+            f"{len(after['locators'])} locators, loop {after['loop']['start_bar']:g}-{after['loop']['end_bar']:g}")
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-noteedit: pattern -> transpose / velocity / shift / delete -> exact
+# --------------------------------------------------------------------------
+
+def cmd_selftest_noteedit(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    pattern = ([{"pitch": 36, "start_time": t, "duration": 0.25, "velocity": 100} for t in (0.0, 2.0)]
+               + [{"pitch": 38, "start_time": t, "duration": 0.25, "velocity": 110} for t in (1.0, 3.0)]
+               + [{"pitch": 42, "start_time": i * 0.5, "duration": 0.125, "velocity": 80} for i in range(8)])
+    with temp_track(client) as track:
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+        client.send("add_notes_to_clip", {"track_index": track, "clip_index": 0, "notes": pattern})
+        print(f"selftest-noteedit via {ops.label}: temp track {track}, 12-note drum pattern")
+        try:
+            notes = client.send("get_clip_notes", {"track_index": track, "clip_index": 0})["notes"]
+            ids = {(n["pitch"], n["start_time"]): n["note_id"] for n in notes}
+            kicks = [ids[(36, 0.0)], ids[(36, 2.0)]]
+            ops.run("modify_notes", track_index=track, clip_index=0,
+                    selection={"note_ids": kicks}, changes={"transpose": 2})
+            ops.run("modify_notes", track_index=track, clip_index=0,
+                    selection={"pitch_min": 42, "pitch_max": 42, "time_min": 0.5, "time_max": 4},
+                    changes={"velocity_delta": -30})
+            ops.run("modify_notes", track_index=track, clip_index=0,
+                    selection={"note_ids": [ids[(42, 3.5)]]}, changes={"shift": -0.25, "duration": 0.25})
+            ops.run("delete_notes", track_index=track, clip_index=0, selection={"note_ids": [ids[(38, 3.0)]]})
+            try:
+                ops.run("modify_notes", track_index=track, clip_index=0,
+                        selection={"pitch_min": 36, "pitch_max": 38}, changes={"transpose": 100})
+                c.check("invalid edit refused", False, "pitch 136 accepted")
+            except CommandError as e:
+                c.check("invalid edit refused", "pitch" in str(e))
+
+            after = client.send("get_clip_notes", {"track_index": track, "clip_index": 0})["notes"]
+            got = sorted((n["pitch"], round(n["start_time"], 4), round(n["duration"], 4), int(n["velocity"]))
+                         for n in after)
+            want = sorted([(38, 0.0, 0.25, 100), (38, 2.0, 0.25, 100), (38, 1.0, 0.25, 110)]
+                          + [(42, 0.0, 0.125, 80)]
+                          + [(42, i * 0.5, 0.125, 50) for i in range(1, 7)] + [(42, 3.25, 0.25, 50)])
+            c.check("exact result", got == want, f"{len(got)} notes")
+            kept = {n["note_id"] for n in after}
+            c.check("note ids kept", set(kicks) <= kept and ids[(38, 3.0)] not in kept,
+                    "kicks keep ids after transpose; deleted snare gone")
+        except CommandError as e:
+            c.check("note edit commands", False, str(e))
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# selftest-grooves: swing groove on a hat clip -> read back -> remove
+# --------------------------------------------------------------------------
+
+SWING_GROOVE = "Swing MPC 3000 8ths 57"
+
+
+def cmd_selftest_grooves(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    with temp_track(client) as track:
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+        client.send("add_notes_to_clip", {"track_index": track, "clip_index": 0, "notes": [
+            {"pitch": 42, "start_time": i * 0.5, "duration": 0.125, "velocity": 90} for i in range(8)]})
+        pool0 = client.send("get_groove_pool")
+        print(f"selftest-grooves via {ops.label}: temp track {track}, hat 8ths, "
+              f"pool has {len(pool0['grooves'])} groove(s)")
+        try:
+            loaded = ops.run("load_groove", name=SWING_GROOVE)
+            pool = client.send("get_groove_pool")["grooves"]
+            index = next(g["index"] for g in pool if g["name"] == SWING_GROOVE)
+            c.check("load_groove", True, f"{SWING_GROOVE!r} at pool index {index}"
+                    + ("" if len(pool) > len(pool0["grooves"]) else ", was already in the pool"))
+
+            ops.run("assign_groove", track_index=track, clip_index=0, groove_index=index)
+            clip = client.send("get_track_info", {"track_index": track})["clip_slots"][0]["clip"]
+            c.check("assigned", clip.get("groove") == SWING_GROOVE, str(clip.get("groove")))
+            # Live's API cannot clear a clip's groove; the clip goes with its temp track.
+            c.info("remove", "not possible via Live's API; clip deleted with the temp track")
+        except CommandError as e:
+            c.check("groove commands", False, str(e))
+    pool1 = client.send("get_groove_pool")
+    left = [g["name"] for g in pool1["grooves"] if g["name"] not in {x["name"] for x in pool0["grooves"]}]
+    if left:
+        c.info("groove pool", f"{left} stays in the Set's pool: Live's API cannot remove pool grooves")
+    return c.finish()
+
+
+# --------------------------------------------------------------------------
+# Day-5 selftests (E2E run 1 gaps)
+# --------------------------------------------------------------------------
+
+def _kit_pads(client: Client, track: int):
+    pads = client.send("get_drum_pads", {"track_index": track})["pads"]
+    by_note = {p["note"]: p for p in pads}
+    hat = next((p for p in pads if "hat" in p["name"].lower() and "open" not in p["name"].lower()), by_note.get(42))
+    return pads, by_note[36], by_note[38], hat
+
+
+def cmd_selftest_notewrite(client: Client, via_server: bool) -> int:
+    """Compact notes, repeats, write_drum_pattern and compact read-back are
+    server-side tools, so both modes call them through the server; the result
+    is checked over the raw socket."""
+    server = ServerOps()
+    c = Checker()
+    with temp_track(client) as track:
+        client.send("load_browser_item", {"track_index": track, "item_uri": browser_uri(client, "drums", DRUM_KIT)})
+        print(f"selftest-notewrite (server-side tools, both modes): temp track {track} with {DRUM_KIT}")
+        try:
+            out = server.run("create_clip", track_index=track, clip_index=0, length=16.0, name="Bass Line",
+                             notes=[[36, 0, 0.5, 110], [36, 1.5, 0.5, 90], [43, 3, 0.75, 100]],
+                             repeat_every_beats=4)["message"]
+            raw = client.send("get_clip_notes", {"track_index": track, "clip_index": 0})
+            starts = sorted(n["start_time"] for n in raw["notes"])
+            c.check("create_clip + notes", raw["clip_name"] == "Bass Line" and raw["note_count"] == 12
+                    and starts[:3] == [0.0, 1.5, 3.0] and starts[-1] == 15.0, f"{raw['note_count']} notes")
+            groove = client.send("get_track_info", {"track_index": track})["clip_slots"][0]["clip"]["groove"]
+            c.info("new clip groove", f"{groove!r} (create_clip reports it: {'groove' in out})")
+
+            pads, kick, snare, hat = _kit_pads(client, track)
+            pattern = {kick["name"]: "x...x...x...x...", "Snare": "....x.......x...",
+                       str(hat["note"]): "x.x.x.x.x.x.x.X."}
+            server.run("write_drum_pattern", track_index=track, clip_index=1, pattern=pattern, name="Beat")
+            beat = client.send("get_clip_notes", {"track_index": track, "clip_index": 1})
+            by_pitch = {}
+            for n in beat["notes"]:
+                by_pitch.setdefault(n["pitch"], []).append(n)
+            ok = (sorted(n["start_time"] for n in by_pitch.get(kick["note"], [])) == [0, 1, 2, 3]
+                  and sorted(n["start_time"] for n in by_pitch.get(snare["note"], [])) == [1, 3]
+                  and len(by_pitch.get(hat["note"], [])) == 8
+                  and max(n["velocity"] for n in by_pitch[hat["note"]]) == 127)
+            c.check("write_drum_pattern", ok and beat["clip_name"] == "Beat",
+                    f"{kick['name']}={kick['note']}, Snare->{snare['note']}, {hat['note']}: {beat['note_count']} notes")
+
+            try:
+                server.run("write_drum_pattern", track_index=track, clip_index=2, pattern={"Cowbell": "x..."})
+                c.check("unknown pad refused", False, "Cowbell accepted")
+            except CommandError as e:
+                c.check("unknown pad refused", "No pad 'Cowbell'" in str(e))
+
+            compact = server.run("get_clip_notes", track_index=track, clip_index=1, compact=True)
+            want = sorted([[n["pitch"], n["start_time"], n["duration"], int(n["velocity"])] for n in beat["notes"]],
+                          key=lambda r: (r[1], r[0]))
+            c.check("compact read-back", compact["notes"] == want, f"{len(compact['notes'])} rows")
+        except CommandError as e:
+            c.check("note writing tools", False, str(e))
+    return c.finish()
+
+
+def cmd_selftest_devparams(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    returns = client.send("get_session_info")["return_track_count"]
+    master_n = len(snapshot(client)["master_track"]["devices"])
+    name = None
+    limiter = False
+    with temp_track(client) as track:
+        client.send("load_browser_item", {"track_index": track, "item_uri": browser_uri(client, "drums", DRUM_KIT)})
+        print(f"selftest-devparams via {ops.label}: temp track {track}, master Limiter, new return Reverb")
+        try:
+            rack = ops.run("get_device_parameters", track_index=track, device_index=0, include_chains=False) \
+                if not via_server else ops.run("get_device_parameters", track_index=track, device_index=0)
+            size = len(json.dumps(rack))
+            full = len(json.dumps(client.send("get_device_parameters", {"track_index": track, "device_index": 0})))
+            c.check("drum rack read is shallow", "chains" not in rack["device"] and rack["device"].get("chain_count", 0) > 0
+                    and size < 20000, f"{size // 1024} KB vs {full // 1024} KB with chains")
+
+            client.send("load_browser_item", {"track_index": 0, "item_uri": browser_uri(client, "audio_effects", "Limiter"),
+                                              "track_type": "master"})
+            limiter = True
+            p = ops.run("get_device_parameters", track_index=0, device_index=master_n, track_type="master")
+            ceiling = next(q for q in p["device"]["parameters"] if q["name"].strip() == "Ceiling")
+            new = ceiling["min"] + (ceiling["max"] - ceiling["min"]) * 0.75
+            ops.run("set_device_parameter", track_index=0, device_index=master_n, value=new,
+                    parameter_name="Ceiling", track_type="master")
+            back = next(q for q in ops.run("get_device_parameters", track_index=0, device_index=master_n,
+                                           track_type="master")["device"]["parameters"] if q["name"].strip() == "Ceiling")
+            c.check("master Limiter Ceiling", _close(back["value"], new, 1e-4), f"{ceiling['value']:g} -> {back['value']:g}")
+
+            client.send("create_return_track")
+            client.send("load_browser_item", {"track_index": returns, "item_uri": browser_uri(client, "audio_effects", "Reverb"),
+                                              "track_type": "return"})
+            name = snapshot(client)["return_tracks"][returns]["name"]
+            # Reverb's Decay Time is stored 0..1; only its display is in seconds.
+            ops.run("set_device_parameter", track_index=returns, device_index=0, value=0.6,
+                    parameter_name="Decay Time", track_type="return")
+            decay = next(q for q in ops.run("get_device_parameters", track_index=returns, device_index=0,
+                                            track_type="return", **({"name_filter": "decay"} if via_server else {}))
+                         ["device"]["parameters"] if q["name"].strip() == "Decay Time")
+            c.check("return Reverb Decay Time", _close(decay["value"], 0.6, 1e-3),
+                    f"0.6 shows as {decay.get('value_string', '?')}")
+            try:
+                ops.run("set_device_parameter", track_index=0, device_index=master_n, value=99.0,
+                        parameter_name="Ceiling", track_type="master")
+                c.check("out-of-range refused", False, "99 accepted")
+            except CommandError as e:
+                c.check("out-of-range refused", "takes" in str(e))
+        except CommandError as e:
+            c.check("device parameter commands", False, str(e))
+        finally:
+            if limiter:
+                client.send("delete_device", {"track_index": 0, "device_index": master_n, "track_type": "master",
+                                              "expected_name": "Limiter"})
+            if name is not None:
+                client.send("delete_return_track", {"return_index": returns, "expected_name": name})
+    snap = snapshot(client)
+    c.check("cleaned up", len(snap["return_tracks"]) == returns and len(snap["master_track"]["devices"]) == master_n)
+    return c.finish()
+
+
+def cmd_selftest_levels(client: Client, via_server: bool) -> int:
+    """measure_levels is a server-side tool (using get_meters when present);
+    both modes call it through the server."""
+    server = ServerOps()
+    c = Checker()
+    # Live's track meters ignore solo (a soloed-out track still shows its
+    # level), so "silent reads ~0" is checked on a second, empty temp track
+    # rather than on the Set's own tracks, which may hold a song.
+    with temp_track(client) as track, temp_track(client, "ableton_cli silent") as silent:
+        client.send("load_browser_item", {"track_index": track, "item_uri": browser_uri(client, "drums", DRUM_KIT)})
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+        client.send("add_notes_to_clip", {"track_index": track, "clip_index": 0, "notes": [
+            {"pitch": 36, "start_time": float(b), "duration": 0.25, "velocity": 127, "mute": False} for b in range(4)]})
+        print(f"selftest-levels (server-side tool, both modes): temp track {track}, kick loop (soloed); "
+              f"empty track {silent}")
+        song_time = client.send("get_session_info")["current_song_time"]
+        client.send("set_track_solo", {"track_index": track, "solo": True})   # the Set's own song stays silent
+        try:
+            meters = client.send("get_meters")
+            c.check("get_meters", len(meters["tracks"]) == client.send("get_session_info")["track_count"]
+                    and "master" in meters, f"{len(meters['tracks'])} tracks, {len(meters['returns'])} returns")
+            client.send("fire_clip", {"track_index": track, "clip_index": 0})
+            time.sleep(2.5)
+            out = server.run("measure_levels", seconds=3.0, settle_seconds=1.0)
+            t = next(x for x in out["tracks"] if x["index"] == track)
+            quiet = next(x for x in out["tracks"] if x["index"] == silent)
+            c.check("measure_levels while playing", out["source"] == "get_meters" and t["peak"] > 0.05
+                    and out["master"]["peak"] > 0.05 and quiet["peak"] < 0.01,
+                    f"{out['samples']} samples, track peak {t['peak']} mean {t['mean']}, "
+                    f"empty track {quiet['peak']}, master {out['master']['peak']}")
+
+            # Chunking: shrink the per-call budget so an 8 s window needs
+            # several calls, as a whole song does with the real 40 s budget.
+            import MCP_Server.server as srv
+            budget = srv._CALL_BUDGET_SEC
+            srv._CALL_BUDGET_SEC = 3.0
+            try:
+                first = server.run("measure_levels", seconds=8.0, settle_seconds=1.0)
+                c.check("long window returns a job", first.get("status") == "running" and first.get("job_id"),
+                        f"job {first.get('job_id')}, {first.get('measured_seconds')} s measured")
+                try:
+                    server.run("measure_levels", seconds=2.0)
+                    c.check("second measurement refused while running", False, "started")
+                except CommandError as e:
+                    c.check("second measurement refused while running", "still running" in str(e))
+                out = first
+                for _ in range(10):
+                    if out.get("status") != "running":
+                        break
+                    out = server.run("measure_levels", job_id=first["job_id"])
+                t = next(x for x in out["tracks"] if x["index"] == track)
+                c.check("chunks combine into one result", out.get("calls", 1) >= 3 and out["seconds"] == 8.0
+                        and out["samples"] >= 20 and t["peak"] > 0.05,
+                        f"{out.get('calls')} calls, {out['samples']} samples, track peak {t['peak']}")
+            finally:
+                srv._CALL_BUDGET_SEC = budget
+        except CommandError as e:
+            c.check("level commands", False, str(e))
+        finally:
+            client.send("stop_clip", {"track_index": track, "clip_index": 0})
+            client.send("stop_playback")
+            client.send("set_track_solo", {"track_index": track, "solo": False})
+            client.send("set_current_song_time", {"time": song_time})
+    return c.finish()
+
+
+def cmd_selftest_search(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    print(f"selftest-search via {ops.label}")
+    try:
+        args = {"query": "808 core kit"}
+        args.update({"category": "drums"} if via_server else {"roots": ["drums"]})
+        r = ops.run("search_browser", **args)
+        c.check("find a drum kit", any(x["name"] == DRUM_KIT for x in r["results"]),
+                f"{r['count']} result(s): {', '.join(x['name'] for x in r['results'][:3])}")
+        args = {"query": "reverb", "limit": 5}
+        args.update({"category": "audio_effects"} if via_server else {"roots": ["audio_effects"]})
+        r = ops.run("search_browser", **args)
+        c.check("limit respected", 0 < r["count"] <= 5, f"{r['count']} results")
+        uri = next(x["uri"] for x in r["results"] if x["is_loadable"])
+        with temp_track(client) as track:
+            ops.load(track, uri)
+            devices = client.send("get_track_info", {"track_index": track})["devices"]
+            c.check("result loads", len(devices) == 1, devices[0]["name"] if devices else "nothing loaded")
+        if via_server:
+            listing = ops.run("get_browser_items_at_path", path="drums", limit=3)
+            c.check("listing capped", len(listing["items"]) == 3 and "truncated" in listing,
+                    f"3 of {listing['total_items']}")
+    except CommandError as e:
+        c.check("search commands", False, str(e))
+    return c.finish()
+
+
+def cmd_selftest_groovefix(client: Client, via_server: bool) -> int:
+    ops = make_ops(client, via_server)
+    c = Checker()
+    with temp_track(client) as track:
+        client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
+        client.send("create_clip", {"track_index": track, "clip_index": 1, "length": 4.0})
+        session = client.send("get_session_info")
+        pool = client.send("get_groove_pool")
+        inherited = client.send("get_track_info", {"track_index": track})["clip_slots"][0]["clip"]["groove"]
+        print(f"selftest-groovefix via {ops.label}: temp track {track}")
+        c.check("groove_amount in session info", session.get("groove_amount") == pool["global_amount"],
+                f"{session.get('groove_amount')}")
+        c.info("new clip groove", f"{inherited!r} with global amount {pool['global_amount']:g}")
+        try:
+            if via_server:
+                ops.run("clear_clip_groove", track_index=track, clip_indexes=[0, 1])
+            else:
+                for slot in (0, 1):
+                    ops.run("clear_clip_groove", track_index=track, clip_index=slot)
+            slots = client.send("get_track_info", {"track_index": track})["clip_slots"]
+            names = {slots[0]["clip"]["groove"], slots[1]["clip"]["groove"]}
+            neutral = next((g for g in client.send("get_groove_pool")["grooves"] if g["name"] in names), None)
+            c.check("clips play straight", len(names) == 1 and neutral is not None
+                    and all(neutral[k] == 0 for k in ("timing", "random", "velocity", "quantize")),
+                    f"{names.pop()} (all amounts 0)")
+            before = len(client.send("get_groove_pool")["grooves"])
+            ops.run("clear_clip_groove", track_index=track, clip_index=0)
+            c.check("neutral groove reused", len(client.send("get_groove_pool")["grooves"]) == before)
+        except CommandError as e:
+            c.check("groove commands", False, str(e))
+    c.info("groove pool", "the neutral groove stays in the Set's pool (Live's API can't remove pool grooves)")
+    return c.finish()
+
+
+SAVE_FOLDER = os.environ.get("ABLETON_CLI_SAVE_FOLDER", "")
+SAVE_NAME = "ableton_cli save test"
+
+
+def cmd_selftest_savefolder(client: Client, via_server: bool) -> int:
+    """save_set's folder rule, without sending any key to Live: a missing
+    folder outside Music/Documents is refused before Live is touched and is
+    not created; one inside Documents is planned (not created here)."""
+    import tempfile
+    import MCP_Server.save_set as ss
+    server = ServerOps()
+    c = Checker()
+    print(f"selftest-savefolder via {'MCP server' if via_server else 'save_set module'}: no keys sent")
+    title = ss.find_live_window()[2]
+    outside = os.path.join(tempfile.gettempdir(), f"ableton_cli savefolder {os.getpid()}", "Run")
+    if via_server:
+        try:
+            server.run("save_set", folder=outside, filename=SAVE_NAME)
+            msg = "saved"
+        except CommandError as e:
+            msg = str(e)
+    else:
+        try:
+            ss.save_set(outside, SAVE_NAME)
+            msg = "saved"
+        except ss.SaveError as e:
+            msg = str(e)
+    c.check("missing folder outside Music/Documents refused", "only creates folders inside" in msg, msg[:90])
+    c.check("nothing created, Live untouched", not os.path.exists(os.path.dirname(outside))
+            and ss.find_live_window()[2] == title)
+    inside = os.path.join(os.path.expanduser("~"), "Documents", f"ableton_cli savefolder {os.getpid()}", "Run")
+    plan = ss.folders_to_create(inside)
+    c.check("missing folder inside Documents is allowed", [str(p) for p in plan] ==
+            [os.path.dirname(inside), inside] and not os.path.exists(os.path.dirname(inside)),
+            f"would create {len(plan)} folder(s)")
+    return c.finish()
+
+
+def cmd_selftest_save(client: Client, via_server: bool) -> int:
+    """save_set is a server-side tool (Windows UI automation); both modes call
+    it through the server. Needs an Untitled Set. Saves into
+    ABLETON_CLI_SAVE_FOLDER, or by default into a new timestamped folder under
+    Documents\\AbletonMCP selftest (checking that save_set creates it).
+    It sends Ctrl+S / Ctrl+Shift+S to Live and leaves the saved file behind."""
+    server = ServerOps()
+    c = Checker()
+    from MCP_Server.save_set import find_live_window, parse_title
+    folder = SAVE_FOLDER or os.path.join(os.path.expanduser("~"), "Documents", "AbletonMCP selftest",
+                                         time.strftime("%Y-%m-%d %H%M%S"))
+    created = not os.path.isdir(folder)
+    name, dirty = parse_title(find_live_window()[2])
+    if name != "Untitled":
+        print(f"selftest-save: the open Set is already saved as {name!r}; run it on a new Set")
+        return 2
+    print(f"selftest-save (server-side tool, both modes): Save As into {folder}")
+    try:
+        out = server.run("save_set", folder=folder, filename=SAVE_NAME)["message"]
+        title = find_live_window()[2]
+        path = out.split(" to ", 1)[-1].split(" (", 1)[0] if " to " in out else ""
+        c.check("Save As", out.startswith("Saved") and parse_title(title) == (SAVE_NAME, False)
+                and os.path.exists(path), path or out)
+        if created:
+            c.check("missing folder created", os.path.isdir(folder) and "created folder" in out)
+
+        with temp_track(client, "ableton_cli dirty"):
+            pass                                   # create + delete: Set now has unsaved changes
+        time.sleep(0.3)
+        c.check("change marks Set dirty", parse_title(find_live_window()[2])[1])
+        out = server.run("save_set")["message"]
+        c.check("Save (Ctrl+S)", out.startswith("Saved") and not parse_title(find_live_window()[2])[1], out)
+
+        try:
+            server.run("save_set", folder=folder, filename=SAVE_NAME)
+            c.check("existing name refused", False, "overwrote")
+        except CommandError as e:
+            c.check("existing name refused", "already exists" in str(e))
+    except CommandError as e:
+        c.check("save commands", False, str(e))
+    return c.finish()
+
+
+SELFTESTS = {
+    "selftest-notes": cmd_selftest_notes,
+    "selftest-connection": cmd_selftest_connection,
+    "selftest-mixer": cmd_selftest_mixer,
+    "selftest-drums": cmd_selftest_drums,
+    "selftest-deletes": cmd_selftest_deletes,
+    "selftest-returns": cmd_selftest_returns,
+    "selftest-automation": cmd_selftest_automation,
+    "selftest-meters": cmd_selftest_meters,
+    "selftest-arrangement": cmd_selftest_arrangement,
+    "selftest-noteedit": cmd_selftest_noteedit,
+    "selftest-grooves": cmd_selftest_grooves,
+    "selftest-notewrite": cmd_selftest_notewrite,
+    "selftest-devparams": cmd_selftest_devparams,
+    "selftest-levels": cmd_selftest_levels,
+    "selftest-search": cmd_selftest_search,
+    "selftest-groovefix": cmd_selftest_groovefix,
+    "selftest-savefolder": cmd_selftest_savefolder,
+    "selftest-save": cmd_selftest_save,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Send commands straight to the AbletonMCP Remote Script socket.",
+    )
+    parser.add_argument("command", help="ping | " + " | ".join(SELFTESTS) + " | any Remote Script command type")
+    parser.add_argument("params", nargs="*", help="JSON object or key=value pairs")
+    parser.add_argument("--via-server", action="store_true",
+                        help="selftests: drive the steps through MCP_Server tool functions")
+    parser.add_argument("--host", default=HOST)
+    parser.add_argument("--port", type=int, default=PORT)
+    args = parser.parse_args(argv)
+
+    try:
+        client = Client(args.host, args.port)
+    except OSError as e:
+        print(f"Could not connect to {args.host}:{args.port} ({e}). "
+              "Is Live running with AbletonMCP selected as a Control Surface?")
+        return 2
+
+    try:
+        if args.command == "ping":
+            return cmd_ping(client)
+        if args.command in SELFTESTS:
+            return SELFTESTS[args.command](client, args.via_server)
+        result = client.send(args.command, parse_params(args.params))
+        print(json.dumps(result, indent=2))
+        return 0
+    except CommandError as e:
+        print(f"Error from Remote Script: {e}")
+        return 1
+    finally:
+        client.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

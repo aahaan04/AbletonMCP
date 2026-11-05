@@ -1,6 +1,6 @@
 # AbletonMCP capabilities audit
 
-Snapshot of `dev` as of 2026-11-04 (package 1.4.5, Remote Script 1.11.1), measured
+Snapshot of `dev` as of 2026-11-05 (package 1.4.5, Remote Script 1.11.1), measured
 against the goal: Claude produces a full track in Live end to end with no manual steps.
 
 ## 1. What the MCP can do today
@@ -13,8 +13,8 @@ deadline; 60 s for audio import).
 
 **Session / transport**
 - `get_session_info` — tempo, time signature, track/return counts, master volume/pan and output meters, transport and loop state, global `groove_amount`.
-- `measure_levels` — play for N seconds (optionally from a bar), discard the first seconds of held peaks, return peak/mean/clipping per track, return and master, optionally per locator section. Uses the one-call `get_meters` command.
-- `save_set` — save the open Set (Windows): Ctrl+S, or Save As to a folder + name. UI automation of Live's own Save command; see the note under §2.
+- `measure_levels` — play for N seconds or `bars` (optionally from a bar), discard the first seconds of held peaks, return peak/mean/clipping per track, return and master, optionally per locator section. Uses the one-call `get_meters` command. Up to 600 s, so a whole song: anything over ~40 s (Claude Desktop drops a tool call after 60 s) keeps measuring in a background thread, and the call returns a `job_id`; `measure_levels(job_id=…)` waits up to 40 s more per call, and the last call returns one combined result (`calls` says how many it took). `cancel=true` stops early with what was measured. One measurement at a time. Note: Live's track meters ignore solo, so a soloed-out track still shows its level; read the master for what is actually heard.
+- `save_set` — save the open Set (Windows): Ctrl+S, or Save As to a folder + name. UI automation of Live's own Save command; see the note under §2. A missing target folder is created only inside `~\Music` or `~\Documents`, and is removed again if the save fails; anywhere else it is refused before Live is touched.
 - `get_remote_script_info` — Remote Script version + capability handshake.
 - `get_session_snapshot` — full dump: tracks, mixer values, devices (+params, nested chains), session and arrangement clips, notes.
 - `set_tempo` — set song BPM.
@@ -121,7 +121,9 @@ window is found by class and executable path; it's foregrounded without sending 
 key; Ctrl+S is sent only after confirming Live is the foreground window; Save As fills
 the dialog through `WM_SETTEXT` and presses its own Save button (no typing); existing
 files are never overwritten; anything unexpected returns an error. Live saves a new Set
-as `<folder>\<name> Project\<name>.als`. Not available on macOS.
+as `<folder>\<name> Project\<name>.als`. Missing folders are created only under the
+user's Music or Documents folder (paths are resolved first, so `..` can't escape).
+Not available on macOS.
 
 ## 2. Remaining gaps, prioritised for "full track, no manual steps"
 

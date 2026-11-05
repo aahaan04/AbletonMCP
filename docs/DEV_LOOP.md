@@ -20,7 +20,8 @@ uv run python scripts\ableton_cli.py get_track_info track_index=0  # any command
 
 # Run every selftest both ways (PowerShell):
 foreach ($t in 'notes','connection','mixer','drums','deletes','returns','automation','meters',
-              'arrangement','noteedit','grooves','notewrite','devparams','levels','search','groovefix') {
+              'arrangement','noteedit','grooves','notewrite','devparams','levels','search','groovefix',
+              'savefolder') {
   foreach ($v in '', '--via-server') { uv run python scripts\ableton_cli.py "selftest-$t" $v } }
 
 # 3. Unit tests (no Live needed).
@@ -58,10 +59,11 @@ extra returns.
 | `selftest-grooves` | load "Swing MPC 3000 8ths 57", assign to a hat clip, read back. Leaves the groove in the Set's pool (Live's API can't remove it) |
 | `selftest-notewrite` | server tools (same in both modes): `create_clip` with compact notes + repeat, `write_drum_pattern` on the 808 kit by pad name/number, unknown pad refused, compact read-back = raw notes |
 | `selftest-devparams` | drum rack read shallow (KB vs full); master Limiter Ceiling and return Reverb Decay Time set by name and read back; out-of-range refused |
-| `selftest-levels` | `get_meters` shape; `measure_levels` (server tool, both modes) on a kick loop: track/master peak > 0.05, silent tracks < 0.01 |
+| `selftest-levels` | `get_meters` shape; `measure_levels` (server tool, both modes) on a soloed kick loop: track/master peak > 0.05, an empty temp track < 0.01; then with the per-call budget cut to 3 s, an 8 s window returns a job, a second measurement is refused, and ≥3 calls combine into one result. Playhead and solo restored |
+| `selftest-savefolder` | `save_set` folder rule without sending keys: a missing folder outside Music/Documents is refused, nothing created, Live's title unchanged; a missing one under Documents is allowed (planned, not created) |
 | `selftest-search` | find "808 Core Kit" in drums, limit respected, a result loads; capped listing (via server) |
 | `selftest-groovefix` | `groove_amount` in session info; new clips' inherited groove reported; `clear_clip_groove` on two clips → one neutral groove, reused. Leaves "AbletonMCP No Groove" in the pool |
-| `selftest-save` | **Not in the loop above; run deliberately.** Sends Ctrl+S / Ctrl+Shift+S to Live. Needs a new Untitled Set and `ABLETON_CLI_SAVE_FOLDER`: Save As there, change, Ctrl+S, existing name refused. Leaves the saved Set behind, and the open Set becomes that file |
+| `selftest-save` | **Not in the loop above; run deliberately.** Sends Ctrl+S / Ctrl+Shift+S to Live. Needs a new Untitled Set. Saves into `ABLETON_CLI_SAVE_FOLDER`, or by default into a new timestamped folder under `Documents\AbletonMCP selftest` (checking save_set creates it): Save As, change, Ctrl+S, existing name refused. Leaves the saved Set behind, and the open Set becomes that file |
 
 Set `PYTHONIOENCODING=utf-8` if the console mangles the multi-byte output.
 `selftest-meters` plays audio for a few seconds; `selftest-arrangement` plays the

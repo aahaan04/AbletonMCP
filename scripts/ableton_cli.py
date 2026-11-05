@@ -991,12 +991,18 @@ def cmd_selftest_levels(client: Client, via_server: bool) -> int:
     both modes call it through the server."""
     server = ServerOps()
     c = Checker()
-    with temp_track(client) as track:
+    # Live's track meters ignore solo (a soloed-out track still shows its
+    # level), so "silent reads ~0" is checked on a second, empty temp track
+    # rather than on the Set's own tracks, which may hold a song.
+    with temp_track(client) as track, temp_track(client, "ableton_cli silent") as silent:
         client.send("load_browser_item", {"track_index": track, "item_uri": browser_uri(client, "drums", DRUM_KIT)})
         client.send("create_clip", {"track_index": track, "clip_index": 0, "length": 4.0})
         client.send("add_notes_to_clip", {"track_index": track, "clip_index": 0, "notes": [
             {"pitch": 36, "start_time": float(b), "duration": 0.25, "velocity": 127, "mute": False} for b in range(4)]})
-        print(f"selftest-levels (server-side tool, both modes): temp track {track}, kick loop")
+        print(f"selftest-levels (server-side tool, both modes): temp track {track}, kick loop (soloed); "
+              f"empty track {silent}")
+        song_time = client.send("get_session_info")["current_song_time"]
+        client.send("set_track_solo", {"track_index": track, "solo": True})   # the Set's own song stays silent
         try:
             meters = client.send("get_meters")
             c.check("get_meters", len(meters["tracks"]) == client.send("get_session_info")["track_count"]
@@ -1005,15 +1011,44 @@ def cmd_selftest_levels(client: Client, via_server: bool) -> int:
             time.sleep(2.5)
             out = server.run("measure_levels", seconds=3.0, settle_seconds=1.0)
             t = next(x for x in out["tracks"] if x["index"] == track)
-            others = [x["peak"] for x in out["tracks"] if x["index"] != track and x["peak"] is not None]
+            quiet = next(x for x in out["tracks"] if x["index"] == silent)
             c.check("measure_levels while playing", out["source"] == "get_meters" and t["peak"] > 0.05
-                    and out["master"]["peak"] > 0.05 and all(p < 0.01 for p in others),
-                    f"{out['samples']} samples, track peak {t['peak']} mean {t['mean']}, master {out['master']['peak']}")
+                    and out["master"]["peak"] > 0.05 and quiet["peak"] < 0.01,
+                    f"{out['samples']} samples, track peak {t['peak']} mean {t['mean']}, "
+                    f"empty track {quiet['peak']}, master {out['master']['peak']}")
+
+            # Chunking: shrink the per-call budget so an 8 s window needs
+            # several calls, as a whole song does with the real 40 s budget.
+            import MCP_Server.server as srv
+            budget = srv._CALL_BUDGET_SEC
+            srv._CALL_BUDGET_SEC = 3.0
+            try:
+                first = server.run("measure_levels", seconds=8.0, settle_seconds=1.0)
+                c.check("long window returns a job", first.get("status") == "running" and first.get("job_id"),
+                        f"job {first.get('job_id')}, {first.get('measured_seconds')} s measured")
+                try:
+                    server.run("measure_levels", seconds=2.0)
+                    c.check("second measurement refused while running", False, "started")
+                except CommandError as e:
+                    c.check("second measurement refused while running", "still running" in str(e))
+                out = first
+                for _ in range(10):
+                    if out.get("status") != "running":
+                        break
+                    out = server.run("measure_levels", job_id=first["job_id"])
+                t = next(x for x in out["tracks"] if x["index"] == track)
+                c.check("chunks combine into one result", out.get("calls", 1) >= 3 and out["seconds"] == 8.0
+                        and out["samples"] >= 20 and t["peak"] > 0.05,
+                        f"{out.get('calls')} calls, {out['samples']} samples, track peak {t['peak']}")
+            finally:
+                srv._CALL_BUDGET_SEC = budget
         except CommandError as e:
             c.check("level commands", False, str(e))
         finally:
             client.send("stop_clip", {"track_index": track, "clip_index": 0})
             client.send("stop_playback")
+            client.send("set_track_solo", {"track_index": track, "solo": False})
+            client.send("set_current_song_time", {"time": song_time})
     return c.finish()
 
 
@@ -1083,27 +1118,65 @@ SAVE_FOLDER = os.environ.get("ABLETON_CLI_SAVE_FOLDER", "")
 SAVE_NAME = "ableton_cli save test"
 
 
+def cmd_selftest_savefolder(client: Client, via_server: bool) -> int:
+    """save_set's folder rule, without sending any key to Live: a missing
+    folder outside Music/Documents is refused before Live is touched and is
+    not created; one inside Documents is planned (not created here)."""
+    import tempfile
+    import MCP_Server.save_set as ss
+    server = ServerOps()
+    c = Checker()
+    print(f"selftest-savefolder via {'MCP server' if via_server else 'save_set module'}: no keys sent")
+    title = ss.find_live_window()[2]
+    outside = os.path.join(tempfile.gettempdir(), f"ableton_cli savefolder {os.getpid()}", "Run")
+    if via_server:
+        try:
+            server.run("save_set", folder=outside, filename=SAVE_NAME)
+            msg = "saved"
+        except CommandError as e:
+            msg = str(e)
+    else:
+        try:
+            ss.save_set(outside, SAVE_NAME)
+            msg = "saved"
+        except ss.SaveError as e:
+            msg = str(e)
+    c.check("missing folder outside Music/Documents refused", "only creates folders inside" in msg, msg[:90])
+    c.check("nothing created, Live untouched", not os.path.exists(os.path.dirname(outside))
+            and ss.find_live_window()[2] == title)
+    inside = os.path.join(os.path.expanduser("~"), "Documents", f"ableton_cli savefolder {os.getpid()}", "Run")
+    plan = ss.folders_to_create(inside)
+    c.check("missing folder inside Documents is allowed", [str(p) for p in plan] ==
+            [os.path.dirname(inside), inside] and not os.path.exists(os.path.dirname(inside)),
+            f"would create {len(plan)} folder(s)")
+    return c.finish()
+
+
 def cmd_selftest_save(client: Client, via_server: bool) -> int:
     """save_set is a server-side tool (Windows UI automation); both modes call
-    it through the server. Needs ABLETON_CLI_SAVE_FOLDER and an Untitled Set.
+    it through the server. Needs an Untitled Set. Saves into
+    ABLETON_CLI_SAVE_FOLDER, or by default into a new timestamped folder under
+    Documents\\AbletonMCP selftest (checking that save_set creates it).
     It sends Ctrl+S / Ctrl+Shift+S to Live and leaves the saved file behind."""
     server = ServerOps()
     c = Checker()
     from MCP_Server.save_set import find_live_window, parse_title
-    if not SAVE_FOLDER:
-        print("selftest-save: set ABLETON_CLI_SAVE_FOLDER to an existing folder first")
-        return 2
+    folder = SAVE_FOLDER or os.path.join(os.path.expanduser("~"), "Documents", "AbletonMCP selftest",
+                                         time.strftime("%Y-%m-%d %H%M%S"))
+    created = not os.path.isdir(folder)
     name, dirty = parse_title(find_live_window()[2])
     if name != "Untitled":
         print(f"selftest-save: the open Set is already saved as {name!r}; run it on a new Set")
         return 2
-    print(f"selftest-save (server-side tool, both modes): Save As into {SAVE_FOLDER}")
+    print(f"selftest-save (server-side tool, both modes): Save As into {folder}")
     try:
-        out = server.run("save_set", folder=SAVE_FOLDER, filename=SAVE_NAME)["message"]
+        out = server.run("save_set", folder=folder, filename=SAVE_NAME)["message"]
         title = find_live_window()[2]
-        path = out.split(" to ", 1)[-1] if " to " in out else ""
+        path = out.split(" to ", 1)[-1].split(" (", 1)[0] if " to " in out else ""
         c.check("Save As", out.startswith("Saved") and parse_title(title) == (SAVE_NAME, False)
                 and os.path.exists(path), path or out)
+        if created:
+            c.check("missing folder created", os.path.isdir(folder) and "created folder" in out)
 
         with temp_track(client, "ableton_cli dirty"):
             pass                                   # create + delete: Set now has unsaved changes
@@ -1113,7 +1186,7 @@ def cmd_selftest_save(client: Client, via_server: bool) -> int:
         c.check("Save (Ctrl+S)", out.startswith("Saved") and not parse_title(find_live_window()[2])[1], out)
 
         try:
-            server.run("save_set", folder=SAVE_FOLDER, filename=SAVE_NAME)
+            server.run("save_set", folder=folder, filename=SAVE_NAME)
             c.check("existing name refused", False, "overwrote")
         except CommandError as e:
             c.check("existing name refused", "already exists" in str(e))
@@ -1139,6 +1212,7 @@ SELFTESTS = {
     "selftest-levels": cmd_selftest_levels,
     "selftest-search": cmd_selftest_search,
     "selftest-groovefix": cmd_selftest_groovefix,
+    "selftest-savefolder": cmd_selftest_savefolder,
     "selftest-save": cmd_selftest_save,
 }
 

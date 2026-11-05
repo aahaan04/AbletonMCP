@@ -775,7 +775,9 @@ def save_set(
       "Untitled" Set is refused.
     - folder + filename: Save As a new file, e.g. folder="C:\\Users\\me\\Music",
       filename="My Track". Live usually creates "My Track Project\\My Track.als"
-      inside that folder. An existing file is never overwritten.
+      inside that folder. An existing file is never overwritten. A missing
+      folder is created only inside the user's Music or Documents folder
+      (e.g. "C:\\Users\\me\\Music\\AbletonMCP"); elsewhere it must exist.
 
     The save is verified (file on disk, unsaved-changes marker gone) and an
     error is returned on anything unexpected; no keys are ever sent to a
@@ -795,6 +797,8 @@ def save_set(
             return f"Error saving Set: {e}"
         where = f" to {result['path']}" if result.get("path") else ""
         note = f" ({result['note']})" if result.get("note") else ""
+        if result.get("created_folder"):
+            note += f" (created folder {result['created_folder']})"
         return f"Saved Set '{result['set']}'{where}{note}"
     except Exception as e:
         logger.error(f"Error saving Set: {str(e)}")
@@ -808,7 +812,13 @@ import time as _time
 _now = _time.monotonic
 _sleep = _time.sleep
 _METER_INTERVAL_SEC = 0.1
-_MAX_MEASURE_SEC = 120.0
+_MAX_MEASURE_SEC = 600.0
+# Claude Desktop gives up on a tool call after 60 s. A measurement that does
+# not fit in one call keeps running in a background thread; each call waits
+# at most this long for it, then returns a job_id to continue with.
+_CALL_BUDGET_SEC = 40.0
+_level_jobs: Dict[str, "_LevelJob"] = {}
+_level_jobs_lock = threading.Lock()
 
 
 def _read_meters(ableton, track_indexes: Optional[List[int]], fast: bool) -> Dict[str, Any]:
@@ -848,6 +858,122 @@ class _LevelStats:
                 "clipping": self.peak >= 0.999}
 
 
+class _LevelJob:
+    """One measurement: plays, samples the meters for settle + seconds, then
+    stops playback it started. Runs inline or in a background thread; either
+    way every sample lands in the same totals, so a measurement split over
+    several tool calls is reported as one result."""
+
+    def __init__(self, ableton, fast, seconds, settle_seconds, start_bar, track_indexes,
+                 sections, by_section, session):
+        self.id = os.urandom(4).hex()
+        self.ableton, self.fast = ableton, fast
+        self.seconds, self.settle_seconds = seconds, max(0.0, settle_seconds)
+        self.start_bar, self.track_indexes = start_bar, track_indexes
+        self.sections, self.by_section = sections, by_section
+        self.was_playing = session["is_playing"]
+        self.start_time = session["current_song_time"]
+        self.bpb = 4.0 * session["signature_numerator"] / session["signature_denominator"]
+        self.totals = {"tracks": {}, "returns": {}, "master": _LevelStats()}
+        self.per_section: Dict[str, Dict[str, Any]] = {}
+        self.names: Dict[Any, Any] = {}
+        self.samples = 0
+        self.measured = 0.0
+        self.calls = 1
+        self.cancelled = False
+        self.error: Optional[str] = None
+        self.finished = threading.Event()
+
+    def run(self):
+        ableton, started = self.ableton, False
+        try:
+            if self.start_bar is not None:
+                if self.was_playing:
+                    ableton.send_command("stop_playback")
+                ableton.send_command("set_current_song_time",
+                                     {"time": (self.start_bar - 1) * self.bpb})
+                _sleep(0.15)
+            if self.start_bar is not None or not self.was_playing:
+                ableton.send_command("start_playback")
+                started = True
+            try:
+                settle_until = _now() + self.settle_seconds
+                end = settle_until + self.seconds
+                while _now() < end and not self.cancelled:
+                    reading = _read_meters(ableton, self.track_indexes, self.fast)
+                    if _now() >= settle_until:
+                        self._add(reading)
+                        self.measured = min(self.seconds, _now() - settle_until)
+                    _sleep(_METER_INTERVAL_SEC)
+            finally:
+                if started:
+                    ableton.send_command("stop_playback")
+                    if self.start_bar is not None:
+                        ableton.send_command("set_current_song_time", {"time": self.start_time})
+        except Exception as e:
+            logger.error(f"Error measuring levels: {e}")
+            self.error = str(e)
+        finally:
+            self.finished.set()
+
+    def _add(self, reading):
+        self.samples += 1
+        section = None
+        for t0, name in self.sections:
+            if reading["time"] >= t0 - 1e-6:
+                section = name
+        buckets = [self.totals]
+        if section is not None:
+            buckets.append(self.per_section.setdefault(
+                section, {"tracks": {}, "returns": {}, "master": _LevelStats()}))
+        for b in buckets:
+            for kind in ("tracks", "returns"):
+                for i, t in reading[kind].items():
+                    self.names[(kind, i)] = t.get("name")
+                    b[kind].setdefault(i, _LevelStats()).add(t.get("level"))
+            b["master"].add(reading["master"].get("level"))
+
+    def _render(self, b):
+        out = {"master": b["master"].report(),
+               "tracks": [dict(index=i, name=self.names.get(("tracks", i)), **s.report())
+                          for i, s in sorted(b["tracks"].items())]}
+        if b["returns"]:
+            out["returns"] = [dict(index=i, name=self.names.get(("returns", i)), **s.report())
+                              for i, s in sorted(b["returns"].items())]
+        return out
+
+    def result(self) -> Dict[str, Any]:
+        out = {"samples": self.samples, "seconds": self.seconds,
+               "settle_seconds": self.settle_seconds,
+               "source": "get_meters" if self.fast else "track info polling"}
+        if self.calls > 1:
+            out["calls"] = self.calls
+        if self.cancelled:
+            out["cancelled_after_seconds"] = round(self.measured, 1)
+        out.update(self._render(self.totals))
+        if self.by_section:
+            out["sections"] = {name: self._render(b) for name, b in self.per_section.items()}
+        return out
+
+    def progress(self) -> Dict[str, Any]:
+        return {"status": "running", "job_id": self.id,
+                "measured_seconds": round(self.measured, 1), "total_seconds": self.seconds,
+                "next": f"Call measure_levels(job_id=\"{self.id}\") to continue; each call "
+                        f"waits up to {_CALL_BUDGET_SEC:g} s and the last one returns the "
+                        f"combined result for the whole window."}
+
+
+def _collect_level_job(job: "_LevelJob") -> str:
+    """Wait (bounded) for a background job; its result, or its progress."""
+    if not job.finished.wait(_CALL_BUDGET_SEC):
+        return json.dumps(job.progress(), indent=2)
+    with _level_jobs_lock:
+        _level_jobs.pop(job.id, None)
+    if job.error:
+        return f"Error measuring levels: {job.error}"
+    return json.dumps(job.result(), indent=2)
+
+
 @mcp.tool()
 @telemetry_tool("measure_levels")
 def measure_levels(
@@ -857,6 +983,9 @@ def measure_levels(
     settle_seconds: float = 3.0,
     track_indexes: Optional[List[int]] = None,
     by_section: bool = False,
+    bars: Optional[float] = None,
+    job_id: Optional[str] = None,
+    cancel: bool = False,
     user_prompt: str = ""
 ) -> str:
     """
@@ -872,88 +1001,76 @@ def measure_levels(
     ~3 s, which made a silent track read loud right after a jump.
 
     by_section=true also splits the results by locator section (e.g. Intro,
-    Drop) using the playhead position of each sample, so one long run can
-    compare sections. Keep seconds short (8-30); the call blocks while it plays.
+    Drop) using the playhead position of each sample, so one run over the
+    whole song (e.g. start_bar=1, bars=64, by_section=true) compares sections.
+
+    Long measurements: anything longer than ~40 s keeps playing and measuring
+    in the background. The call then returns {"status": "running", "job_id"};
+    call measure_levels(job_id=...) again (each call waits up to 40 s) until
+    it returns the combined result. cancel=true with job_id stops it early
+    and returns what was measured so far.
 
     Parameters:
-    - seconds: Measuring time after settling (max 120)
+    - seconds: Measuring time after settling (max 600); ignored if bars is given
     - start_bar: Bar to play from (1-based); omit to use the current position
     - settle_seconds: Seconds to discard first (default 3)
     - track_indexes: Tracks to include (default: all)
     - by_section: Also report per locator section
+    - bars: Measure this many bars at the current tempo instead of seconds
+    - job_id: Continue (or cancel) a running measurement
+    - cancel: With job_id, stop the measurement early
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         from .script_handshake import require_capability
 
-        if not 0 < seconds <= _MAX_MEASURE_SEC:
-            return f"Error measuring levels: seconds must be in (0, {_MAX_MEASURE_SEC:g}]"
+        if job_id is not None:
+            with _level_jobs_lock:
+                job = _level_jobs.get(job_id)
+            if job is None:
+                return f"Error measuring levels: no running measurement {job_id!r} (already collected?)"
+            job.calls += 1
+            if cancel:
+                job.cancelled = True
+            return _collect_level_job(job)
+
+        with _level_jobs_lock:
+            for done in [k for k, j in _level_jobs.items() if j.finished.is_set()]:
+                _level_jobs.pop(done)       # finished but never collected
+            running = next(iter(_level_jobs), None)
+        if running is not None:
+            return (f"Error measuring levels: measurement {running!r} is still running; call "
+                    f"measure_levels(job_id=\"{running}\") to collect it (cancel=true stops it)")
+
         ableton = get_ableton_connection()
-        fast = require_capability("get_meters", ableton.send_command) is None
         session = ableton.send_command("get_session_info")
-        was_playing, start_time = session["is_playing"], session["current_song_time"]
-        bpb = 4.0 * session["signature_numerator"] / session["signature_denominator"]
-        started = False
-        if start_bar is not None:
-            if was_playing:
-                ableton.send_command("stop_playback")
-            ableton.send_command("set_current_song_time", {"time": (start_bar - 1) * bpb})
-            _sleep(0.15)
-        if start_bar is not None or not was_playing:
-            ableton.send_command("start_playback")
-            started = True
+        if bars is not None:
+            if bars <= 0:
+                return "Error measuring levels: bars must be positive"
+            bpb = 4.0 * session["signature_numerator"] / session["signature_denominator"]
+            seconds = round(bars * bpb * 60.0 / float(session.get("tempo") or 120.0), 3)
+        if not 0 < seconds <= _MAX_MEASURE_SEC:
+            return (f"Error measuring levels: seconds must be in (0, {_MAX_MEASURE_SEC:g}]"
+                    + (f" ({bars:g} bars is {seconds:g} s at this tempo)" if bars else ""))
+        fast = require_capability("get_meters", ableton.send_command) is None
 
         sections = []
         if by_section and require_capability("get_locators", ableton.send_command) is None:
             locs = sorted(ableton.send_command("get_locators")["locators"], key=lambda l: l["time"])
             sections = [(l["time"], l["name"]) for l in locs]
 
-        totals = {"tracks": {}, "returns": {}, "master": _LevelStats()}
-        per_section: Dict[str, Dict[str, Any]] = {}
-        names = {}
-        samples = 0
-        try:
-            settle_until = _now() + max(0.0, settle_seconds)
-            end = settle_until + seconds
-            while _now() < end:
-                reading = _read_meters(ableton, track_indexes, fast)
-                if _now() >= settle_until:
-                    samples += 1
-                    section = None
-                    for t0, name in sections:
-                        if reading["time"] >= t0 - 1e-6:
-                            section = name
-                    buckets = [totals]
-                    if section is not None:
-                        buckets.append(per_section.setdefault(
-                            section, {"tracks": {}, "returns": {}, "master": _LevelStats()}))
-                    for b in buckets:
-                        for kind in ("tracks", "returns"):
-                            for i, t in reading[kind].items():
-                                names[(kind, i)] = t.get("name")
-                                b[kind].setdefault(i, _LevelStats()).add(t.get("level"))
-                        b["master"].add(reading["master"].get("level"))
-                _sleep(_METER_INTERVAL_SEC)
-        finally:
-            if started:
-                ableton.send_command("stop_playback")
-                if start_bar is not None:
-                    ableton.send_command("set_current_song_time", {"time": start_time})
+        job = _LevelJob(ableton, fast, seconds, settle_seconds, start_bar, track_indexes,
+                        sections, by_section, session)
+        if job.settle_seconds + seconds + 1.0 <= _CALL_BUDGET_SEC:
+            job.run()
+            if job.error:
+                return f"Error measuring levels: {job.error}"
+            return json.dumps(job.result(), indent=2)
 
-        def render(b):
-            out = {"master": b["master"].report(),
-                   "tracks": [dict(index=i, name=names.get(("tracks", i)), **s.report())
-                              for i, s in sorted(b["tracks"].items())]}
-            if b["returns"]:
-                out["returns"] = [dict(index=i, name=names.get(("returns", i)), **s.report())
-                                  for i, s in sorted(b["returns"].items())]
-            return out
-
-        result = {"samples": samples, "seconds": seconds, "settle_seconds": settle_seconds,
-                  "source": "get_meters" if fast else "track info polling", **render(totals)}
-        if by_section:
-            result["sections"] = {name: render(b) for name, b in per_section.items()}
-        return json.dumps(result, indent=2)
+        with _level_jobs_lock:
+            _level_jobs[job.id] = job
+        threading.Thread(target=job.run, name=f"measure_levels-{job.id}", daemon=True).start()
+        return _collect_level_job(job)
     except Exception as e:
         logger.error(f"Error measuring levels: {str(e)}")
         return f"Error measuring levels: {str(e)}"

@@ -35,10 +35,83 @@ def test_target_paths(tmp_path):
     assert typed == tmp_path / "My Track.als"
     assert candidates[1] == tmp_path / "My Track Project" / "My Track.als"
     for folder, name, error in ((str(tmp_path), "a/b", "invalid file name"),
-                                ("relative", "x", "absolute"),
-                                (str(tmp_path / "missing"), "x", "does not exist")):
+                                ("relative", "x", "absolute")):
         with pytest.raises(ss.SaveError, match=error):
             ss.target_paths(folder, name)
+
+
+@pytest.fixture
+def roots(monkeypatch, tmp_path):
+    music, docs = tmp_path / "Music", tmp_path / "Documents"
+    music.mkdir()
+    docs.mkdir()
+    monkeypatch.setattr(ss, "allowed_create_roots", lambda: [music, docs])
+    return music, docs
+
+
+def test_missing_folder_inside_allowed_roots_is_planned(roots):
+    music, docs = roots
+    assert ss.folders_to_create(str(music)) == []
+    assert ss.folders_to_create(str(docs / "Tracks" / "Run 3")) == [docs / "Tracks", docs / "Tracks" / "Run 3"]
+
+
+@pytest.mark.parametrize("where", ["outside", "root_sibling", "dotdot"])
+def test_missing_folder_elsewhere_is_refused(roots, tmp_path, where):
+    music, _ = roots
+    folder = {"outside": tmp_path / "Elsewhere" / "x",
+              "root_sibling": tmp_path / "MusicX",               # prefix match is not containment
+              "dotdot": music / ".." / "Escaped"}[where]
+    with pytest.raises(ss.SaveError, match="only creates folders inside"):
+        ss.folders_to_create(str(folder))
+    assert not (tmp_path / "Elsewhere").exists() and not (tmp_path / "Escaped").exists()
+
+
+def test_existing_folder_anywhere_is_fine(tmp_path, roots):
+    assert ss.folders_to_create(str(tmp_path)) == []
+
+
+def test_refusal_happens_before_live_is_touched(monkeypatch, roots, tmp_path):
+    sent = _fake_live(monkeypatch, "Untitled* - Ableton Live 12 Trial")
+    monkeypatch.setattr(ss, "find_live_window", lambda: sent.append("find") or (1, 2, "x"), raising=False)
+    with pytest.raises(ss.SaveError, match="only creates folders inside"):
+        ss.save_set(str(tmp_path / "Nope"), "Song")
+    assert sent == []
+
+
+def _fake_save_as(monkeypatch, succeed):
+    sent = _fake_live(monkeypatch, "Untitled* - Ableton Live 12 Trial")
+    state = {"title": "Untitled* - Ableton Live 12 Trial"}
+
+    def fill(dialog, path):
+        if not succeed:
+            raise ss.SaveError("dialog trouble")
+        from pathlib import Path
+        p = Path(path)
+        (p.parent / f"{p.stem} Project").mkdir()
+        (p.parent / f"{p.stem} Project" / p.name).write_bytes(b"als")
+        state["title"] = f"{p.stem} - Ableton Live 12 Trial"
+
+    monkeypatch.setattr(ss, "wait_for_save_dialog", lambda pid: 7, raising=False)
+    monkeypatch.setattr(ss, "fill_and_confirm", fill, raising=False)
+    monkeypatch.setattr(ss, "close_dialog", lambda d: sent.append("closed"), raising=False)
+    monkeypatch.setattr(ss, "_title", lambda h: state["title"], raising=False)
+    return sent
+
+
+def test_save_as_creates_the_folder(monkeypatch, roots):
+    _, docs = roots
+    _fake_save_as(monkeypatch, succeed=True)
+    out = ss.save_set(str(docs / "AbletonMCP" / "Run 3"), "Song")
+    assert out["path"] == str(docs / "AbletonMCP" / "Run 3" / "Song Project" / "Song.als")
+    assert out["created_folder"] == str(docs / "AbletonMCP")
+
+
+def test_failed_save_removes_the_folders_it_created(monkeypatch, roots):
+    _, docs = roots
+    sent = _fake_save_as(monkeypatch, succeed=False)
+    with pytest.raises(ss.SaveError, match="dialog trouble"):
+        ss.save_set(str(docs / "AbletonMCP" / "Run 3"), "Song")
+    assert "closed" in sent and not (docs / "AbletonMCP").exists()
 
 
 def _fake_live(monkeypatch, title):

@@ -41,13 +41,66 @@ def parse_title(title: str) -> tuple[str, bool]:
     return m.group("name"), bool(m.group("dirty"))
 
 
+def allowed_create_roots() -> list[Path]:
+    """Folders under which save_set may create a missing target folder."""
+    home = Path.home()
+    return [home / "Music", home / "Documents"]
+
+
+def _norm(p) -> str:
+    return os.path.normcase(os.path.realpath(p))
+
+
+def folders_to_create(folder: str) -> list[Path]:
+    """The missing folders (outermost first) that Save As into `folder` needs.
+
+    An existing folder is fine anywhere. A missing one is only created inside
+    one of allowed_create_roots(); anything else raises before Live is touched.
+    """
+    if not folder or not os.path.isabs(folder):
+        raise SaveError("folder must be an absolute path")
+    if os.path.isdir(folder):
+        return []
+    if os.path.exists(folder):
+        raise SaveError(f"{folder!r} exists but is not a folder")
+    target = _norm(folder)
+    roots = [r for r in allowed_create_roots() if os.path.isdir(r)]
+    inside = any(target != _norm(r) and os.path.commonpath([target, _norm(r)]) == _norm(r)
+                 for r in roots)
+    if not inside:
+        allowed = " or ".join(str(r) for r in allowed_create_roots())
+        raise SaveError(f"folder {folder!r} does not exist, and save_set only creates folders "
+                        f"inside {allowed}; create it yourself or choose a folder there")
+    missing, p = [], Path(os.path.abspath(folder))
+    while not p.exists():
+        missing.append(p)
+        p = p.parent
+    return list(reversed(missing))
+
+
+def create_folders(missing: list[Path]) -> None:
+    for p in missing:
+        try:
+            p.mkdir()
+        except OSError as e:
+            remove_folders(missing)
+            raise SaveError(f"could not create folder {str(p)!r}: {e.strerror or e}")
+
+
+def remove_folders(created: list[Path]) -> None:
+    """Undo create_folders after a failed save (only folders left empty)."""
+    for p in reversed(created):
+        try:
+            p.rmdir()
+        except OSError:
+            pass
+
+
 def target_paths(folder: str, filename: str) -> tuple[Path, list[Path]]:
     """The path to type into Save As, and where Live may put the file (it
     creates a '<name> Project' folder when saving outside a project)."""
     if not folder or not os.path.isabs(folder):
         raise SaveError("folder must be an absolute path")
-    if not os.path.isdir(folder):
-        raise SaveError(f"folder {folder!r} does not exist")
     name = filename[:-4] if filename.lower().endswith(".als") else filename
     if not name or re.search(r'[\\/:*?"<>|]', name):
         raise SaveError(f"invalid file name {filename!r}")
@@ -270,6 +323,10 @@ def save_set(folder: Optional[str] = None, filename: Optional[str] = None, timeo
         raise SaveError("save_set is only implemented on Windows")
     if (folder is None) != (filename is None):
         raise SaveError("give both folder and filename for Save As, or neither for Save")
+    missing: list[Path] = []
+    if folder is not None:
+        missing = folders_to_create(folder)     # refuses before Live is touched
+        target_paths(folder, filename)          # validates the name, too
     hwnd, pid, title = find_live_window()
     name, dirty = parse_title(title)
     if filename is None:
@@ -290,18 +347,26 @@ def save_set(folder: Optional[str] = None, filename: Optional[str] = None, timeo
     existing = [p for p in candidates if p.exists()]
     if existing:
         raise SaveError(f"{existing[0]} already exists; choose another name (no overwrite)")
-    bring_to_front(hwnd)
-    send_save_shortcut(hwnd, save_as=(name != "Untitled"))
-    dialog = wait_for_save_dialog(pid)
+    create_folders(missing)
     try:
-        fill_and_confirm(dialog, str(typed))
-    except SaveError:
-        close_dialog(dialog)
+        bring_to_front(hwnd)
+        send_save_shortcut(hwnd, save_as=(name != "Untitled"))
+        dialog = wait_for_save_dialog(pid)
+        try:
+            fill_and_confirm(dialog, str(typed))
+        except SaveError:
+            close_dialog(dialog)
+            raise
+        end = time.time() + timeout
+        while time.time() < end:
+            hit = next((p for p in candidates if p.exists()), None)
+            if hit is not None and not parse_title(_title(hwnd))[1]:
+                result = {"saved": True, "set": parse_title(_title(hwnd))[0], "path": str(hit)}
+                if missing:
+                    result["created_folder"] = str(missing[0])
+                return result
+            time.sleep(0.2)
+        raise SaveError("Save As did not produce the file; check Live for a message")
+    except Exception:
+        remove_folders(missing)
         raise
-    end = time.time() + timeout
-    while time.time() < end:
-        hit = next((p for p in candidates if p.exists()), None)
-        if hit is not None and not parse_title(_title(hwnd))[1]:
-            return {"saved": True, "set": parse_title(_title(hwnd))[0], "path": str(hit)}
-        time.sleep(0.2)
-    raise SaveError("Save As did not produce the file; check Live for a message")

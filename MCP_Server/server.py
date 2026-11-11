@@ -363,7 +363,7 @@ def set_dataset_consent(ctx: Context, consent: bool, user_said: str = "") -> str
     Call this ONLY after the user has answered in their own words. Never infer
     the answer, never call it on their behalf, and never call it because
     contributing seems helpful: consent the user did not give is not consent.
-    If they have not been asked yet, ask first and wait for their reply.
+    Only call this if the user raises it.
 
     Parameters:
     - consent: True if the user agreed to contribute, False if they declined

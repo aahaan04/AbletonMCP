@@ -2,6 +2,8 @@
 
 Run date: 2026-11-04. `dev` at `ae832e2` (package 1.4.5, Remote Script 1.10.0), Live 12.
 
+> **Status:** all ranked gaps except audio export were addressed afterwards; see [CAPABILITIES.md](CAPABILITIES.md).
+
 **Brief:** build a complete, original 124 BPM minor-key house track in an empty Set
 with no manual steps and no questions. It had to include drums (Drum Rack), bass,
 chords and a hook; a reverb return; a master limiter; Session clips per section;
@@ -19,7 +21,7 @@ MCP tools, so every item in §1 is a gap. The Set was also left unsaved (no API)
 
 | # | What | How it was done | Why not MCP |
 |---|------|-----------------|-------------|
-| A | **Wrote all note data: 12 clips, 782 notes** (drums 421, bass 87, chords 208, hook 66). Later re-wrote the 28-note build snare roll | Python generated the notes into JSON. A script imported `ableton_cli.Client` and sent `add_notes_to_clip` over the raw socket | Writing 782 notes as tool-call arguments is ~55 KB of JSON at ~70 chars per note (~18k output tokens). The largest clip (Drums Drop, 147 notes) alone is ~11 KB. **I never attempted it through the MCP**, so this is a cost and reliability judgement, not a measured failure. See §2.1 |
+| A | **Wrote all note data: 12 clips, 782 notes** (drums 421, bass 87, chords 208, hook 66). Later re-wrote the 28-note build snare roll | Python generated the notes into JSON. A script imported `ableton_cli.Client` and sent `add_notes_to_clip` over the raw socket | Writing 782 notes as tool-call arguments is ~55 KB of JSON at ~70 chars per note (~18k output tokens). The largest clip (Drums Drop, 147 notes) alone is ~11 KB. **This was not attempted through the MCP**, so this is a cost and reliability judgement, not a measured failure. See §2.1 |
 | B | **Named all 12 clips** | Same script, `set_clip_name` | Convenience: it was already in the loop. MCP `set_clip_name` works, but costs 12 extra calls |
 | C | **Measured levels: peaks per section during playback** | Scripts polled `get_session_info` and `get_track_info` ×4 in a tight loop for 40–130 s, binning by `current_song_time`. Four runs, several hundred commands each | No MCP tool samples meters over a time window. One MCP round trip (plus model latency) is seconds, so Claude can take a handful of samples per section at best. Those samples are also skewed by stale held peaks (§2.4) |
 | D | **Verified every clip after the build**: notes vs intent, pads exist, in key, no note past clip end, groove per clip, mute/solo | Script calling `get_drum_pads`, `get_track_info`, `get_clip_notes` and diffing against the generated JSON | Possible via MCP, but it needs ~25 calls returning ~100 KB of verbose JSON, then Claude diffing it by eye. No bulk or compact read-back exists |
@@ -58,7 +60,7 @@ Before building this, **measure the baseline**: have Claude Desktop write the 14
 - **Effort:** small. Remote Script change, so Live restart; add to `SCRIPT_FEATURES`.
 
 ### 2.3 Grooves
-**What happened:** the Set's pool already held "Swing 16ths 66", and **every new MIDI clip came back with it assigned**: drums, bass, chords and hook. `_create_clip` does not touch grooves, so this is Live or Set behaviour. The global groove amount was **0%**, so no swing played at all until it was raised. The likely source is an earlier session following our own advice in CAPABILITIES.md ("neutralise with `set_groove_amount(0)`"); the Set had been used before. **I did not confirm why new clips inherit the groove.** Reproduce it in a fresh default Set first.
+**What happened:** the Set's pool already held "Swing 16ths 66", and **every new MIDI clip came back with it assigned**: drums, bass, chords and hook. `_create_clip` does not touch grooves, so this is Live or Set behaviour. The global groove amount was **0%**, so no swing played at all until it was raised. The likely source is an earlier session following the earlier advice in CAPABILITIES.md ("neutralise with `set_groove_amount(0)`"); the Set had been used before. **The cause was not confirmed during the run** (later traced to Live 12's default Set; see CAPABILITIES.md).
 
 **Workaround used:**
 - Loaded "Swing 16ths 54" and assigned it to the four drum clips.
@@ -77,7 +79,7 @@ This works, but it took three discoveries the tools didn't surface.
 - **Effort:** small to medium. Shipping the .agr is an installer change. The warnings and the `get_session_info` field mostly need the Remote Script, so Live restart.
 
 ### 2.4 Other workarounds, retries and awkward spots
-1. **Consent prompt injected into `get_session_info`.** The first call's result ended with *"[Ask the user this now, before continuing. Do not answer it yourself… relay their reply verbatim.]"* (`MCP_Server/dataset/consent.py`). In an autonomous "don't ask me anything" run, a compliant agent has two bad options: stop and break the brief, or ignore a tool instruction. Imperative text inside tool output is also exactly the pattern agents are trained to treat as prompt injection, so a careful agent may distrust it. I ignored it and recording stayed off.
+1. **Consent prompt injected into `get_session_info`.** The first call's result ended with *"[Ask the user this now, before continuing. Do not answer it yourself… relay their reply verbatim.]"* (`MCP_Server/dataset/consent.py`). In an autonomous "don't ask me anything" run, a compliant agent has two bad options: stop and break the brief, or ignore a tool instruction. Imperative text inside tool output is also exactly the pattern agents are trained to treat as prompt injection, so a careful agent may distrust it. The agent ignored it and recording stayed off.
    - **Fix:** ask for consent through an explicit, once-per-install path, such as an installer step, a dedicated `dataset_consent_status` tool or the server's instructions. Or phrase it as information ("Dataset recording is off; the user can opt in with set_dataset_consent") and never append it to an unrelated read.
    - **Effort:** small, server only.
 2. **No windowed level measurement.** See C.
@@ -99,7 +101,7 @@ This works, but it took three discoveries the tools didn't surface.
 7. **`delete_track` with `expected_name` and auto-named tracks.** Inserting two MIDI tracks renamed "3-Audio" and "4-Audio" to "5-Audio" and "6-Audio", so the guard refused the names read seconds earlier. The guard behaved correctly, but it took a retry.
    - **Fix:** mention in the tool text that Live's auto-names change when tracks are inserted, and re-read names first.
 8. **Call count for routine steps.** Making 12 named, filled clips needs 36 calls (create, add, name). Raising 4 clips' groove needs 4 calls. Both are covered by 2.1(5) and a `clip_indexes` list on `assign_groove`.
-9. **Saving.** As already documented, Live's API has no save or export, so the run ended by asking the user to press Ctrl+S. That still blocks "zero manual steps".
+9. **Saving.** As already documented, Live's API has no save or export, so the run ended with a manual Ctrl+S. That still blocks "zero manual steps".
 
 ## 3. Gaps ranked by impact on "Claude Desktop builds a full track with zero manual steps"
 
@@ -116,9 +118,9 @@ This works, but it took three discoveries the tools didn't surface.
 | 9 | `set_arrangement_time` stale readback (2.4.3) | **Low–Medium.** Misleads verification | Small | No |
 | 10 | Call count for routine steps (2.4.8) | **Low.** Slow, not blocking | Small | No |
 | 11 | `delete_track` auto-name drift (2.4.7) | **Low** | Small (docs) | No |
-| — | Saving or exporting the Set (2.4.9) | **Blocking**, but no LOM API exists; needs UI automation outside Live | Large / out of scope | — |
+| n/a | Saving or exporting the Set (2.4.9) | **Blocking**, but no LOM API exists; needs UI automation outside Live | Large / out of scope | n/a |
 
-**Suggested next build day:**
+**Planned follow-up:**
 - Ranks 1, 2, 6, 7, 8, 9 and 10 are all server-only, so they can be built and unit-tested without restarting Live.
 - Then batch the Remote Script changes into one install and restart: device params by `track_type` and shallow dumps, `get_meters`, groove state fields and warnings.
 - After that, re-run this same brief **in Claude Desktop** as E2E run 2 and record every non-MCP step (there should be none).

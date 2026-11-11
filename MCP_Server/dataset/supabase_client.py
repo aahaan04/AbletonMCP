@@ -1,4 +1,4 @@
-"""Supabase access for trajectory datasets — reuses telemetry config credentials."""
+"""Supabase access for trajectory datasets; reuses telemetry config credentials."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def create_supabase_client(session_id: str | None = None) -> Client | None:
 def create_admin_client() -> Client | None:
     """Client for operator-side tooling (export, semantics) that must read.
 
-    Anon has insert-only rights by design — the anon key is public, so granting
+    Anon has insert-only rights by design: the anon key is public, so granting
     it select would expose every user's data. Reads therefore require the
     service_role key, which stays in the operator's environment and is never
     packaged:

@@ -35,5 +35,6 @@ exclude-package-data = { "MCP_Server" = ["config.py"] }
 "MCP_Server.bundled_ableton_remote_script" = ["AbletonMCP_init.py"]
 
 [project.urls]
-"Homepage" = "https://github.com/ahujasid/ableton-mcp"
-"Bug Tracker" = "https://github.com/ahujasid/ableton-mcp/issues"
+"Homepage" = "https://github.com/aahaan04/AbletonMCP"
+"Bug Tracker" = "https://github.com/aahaan04/AbletonMCP/issues"
+"Upstream" = "https://github.com/ahujasid/ableton-mcp"

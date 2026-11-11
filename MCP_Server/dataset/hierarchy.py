@@ -65,7 +65,7 @@ def infer_intent_level(text: str, explicit_level: int | None = None) -> int:
 
     Ordered most-specific first: an atomic tweak is more specific than a
     musical operation, which is more specific than a section/song goal.
-    Aesthetic and mix language stays at 5 — those are open-ended goals.
+    Aesthetic and mix language stays at 5; those are open-ended goals.
     """
     if explicit_level is not None and 1 <= explicit_level <= 5:
         return explicit_level

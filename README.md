@@ -12,7 +12,7 @@ Fork built and maintained by Aahaan Sheth ([github.com/aahaan04](https://github.
 
 ## Demo
 
-> **Video:** _link coming soon_
+> **Demo video / GIF:** _link coming soon_
 
 In the demo, Claude starts from an empty Live Set and a single prompt. It sets the tempo, builds drums, bass, chords and a hook, adds a reverb return and a master limiter, writes a filter sweep into the build, arranges about 64 bars with named locators, checks levels per section, and saves the Set. The only manual step is exporting the audio (File > Export Audio/Video), which Live's API does not offer.
 
@@ -77,6 +77,23 @@ Compared with the original project:
 - Locators are now placed at the right bar. The old single-call method could drop them at the previous playhead.
 - `set_arrangement_time` reports the playhead position Live actually applied.
 - Tool results no longer stop the run to ask about dataset recording.
+
+---
+
+## Architecture
+
+```
+Claude Desktop  <--stdio (MCP)-->  MCP server  <--TCP 127.0.0.1:9877 (JSON)-->  Remote Script inside Live
+                                   uv run ableton-mcp                           AbletonMCP control surface
+```
+
+- **MCP server** (`MCP_Server/`): a Python FastMCP server that Claude Desktop launches with `uv --directory <clone> run ableton-mcp`. It exposes the 71 tools and does the work that needs no Live API: compact note parsing, drum step patterns, level measurement windows and `save_set`'s window automation.
+- **Remote Script** (`AbletonMCP_Remote_Script/`): a Live control surface that listens on `127.0.0.1:9877` (loopback only). Each request is `{"type": ..., "params": ...}` and each reply is `{"status": ..., "result" | "message": ...}`. Every command runs on Live's main thread through a bounded queue (64 pending, 8 per tick, 10 s deadline).
+- **Handshake:** the server checks the Remote Script's version and command list, and re-checks before refusing a tool, so a server started before Live still picks up newer commands.
+
+**Restart rules**
+- Remote Script changed: reinstall it, then fully quit and restart Live. Re-selecting the control surface does not reload the code.
+- MCP server changed: fully quit Claude Desktop (tray icon > Quit on Windows, Cmd+Q on macOS) and reopen it.
 
 ---
 
@@ -201,6 +218,18 @@ Each tool's details are in [docs/CAPABILITIES.md](docs/CAPABILITIES.md).
 - **`save_set` is Windows only.** It automates Live's own Save dialog.
 
 Remaining gaps and next steps are tracked in [docs/CAPABILITIES.md](docs/CAPABILITIES.md). The first full-track run and what it changed are in [docs/E2E_RUN_1.md](docs/E2E_RUN_1.md).
+
+---
+
+## Roadmap
+
+Next, in order (details and upstream references in [docs/CAPABILITIES.md](docs/CAPABILITIES.md)):
+1. **Routing, sidechain and groups:** track routing, compressor sidechain inputs and group buses.
+2. **Clip properties and scenes:** loop and length, warp, transpose and gain, plus creating and launching scenes.
+3. **`check_clips`:** one call that verifies a whole track (key, pads, clip ends, grooves, mute and solo).
+4. **Hearing the result:** a real-time resample bounce that can be analysed.
+
+Smaller items: track colour, `duplicate_track`, undo and redo, a `write_chord_progression` helper.
 
 ---
 

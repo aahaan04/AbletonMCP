@@ -1,5 +1,5 @@
 """
-save_set: the parts that can be tested without driving Live's window —
+save_set: the parts that can be tested without driving Live's window:
 title parsing, path checks, the refusal rules, and the tool's error text.
 The keystroke path is exercised by `ableton_cli.py selftest-save` in Live.
 

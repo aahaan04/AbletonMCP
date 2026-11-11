@@ -22,7 +22,7 @@ DEFAULT_PORT = 9877
 # Loopback, not 0.0.0.0. This socket takes unauthenticated commands that import
 # arbitrary absolute paths, load browser items and drive the transport, so
 # anything that can reach the port controls the DAW. Binding every interface
-# exposed that to the whole local network — and to any network the machine is
+# exposed that to the whole local network, and to any network the machine is
 # routable from.
 #
 # Running Live and the MCP server on different machines is the one legitimate
@@ -326,7 +326,7 @@ class AbletonMCP(ControlSurface):
         # character (an accented clip name, an emoji) can straddle two recv()
         # boundaries; decoding each chunk on its own raises there, and the old
         # code answered that with an error frame pushed into a stream the
-        # client was still reading a real response from — desynchronising the
+        # client was still reading a real response from, desynchronising the
         # connection for good.
         buffer = b''
 
@@ -1247,7 +1247,7 @@ class AbletonMCP(ControlSurface):
         """Create an audio clip in the specified audio track clip slot by importing a file.
 
         Requires Ableton Live 12.0.5 or newer (the underlying
-        ClipSlot.create_audio_clip Live API was introduced in 12.0.5 — it is
+        ClipSlot.create_audio_clip Live API was introduced in 12.0.5; it is
         not available in earlier 12.0.x releases).
         """
         try:
@@ -1832,7 +1832,7 @@ class AbletonMCP(ControlSurface):
         """Load an instrument or effect onto a track by its browser URI.
 
         The command dispatcher above calls this method, but it was never
-        defined — and "load_instrument_or_effect" was missing from the list of
+        defined, and "load_instrument_or_effect" was missing from the list of
         main-thread commands as well, so the command fell through to the final
         "Unknown command" branch. Loading a device is exactly what
         _load_browser_item does, so delegate to it; the only difference is the
@@ -3370,7 +3370,7 @@ class AbletonMCP(ControlSurface):
                 self.log_message("Error reading device parameters: " + str(e))
             info["parameters"] = params
 
-        # Devices inside a rack carry the actual sound design — a drum rack's
+        # Devices inside a rack carry the actual sound design: a drum rack's
         # nested Operator, an instrument rack's filter. Without this walk a rack
         # contributes only its 8 macros and the timbral state is invisible.
         if getattr(device, "can_have_chains", False):
@@ -3553,7 +3553,7 @@ class AbletonMCP(ControlSurface):
         return returns
 
     def _serialize_master_track(self, include_params=True):
-        """Master chain — the bus compressor/limiter that shapes the final sound."""
+        """Master chain: the bus compressor/limiter that shapes the final sound."""
         try:
             track = self._song.master_track
             devices = []

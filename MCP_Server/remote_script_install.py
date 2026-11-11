@@ -4,7 +4,7 @@ Since Live 10.1.13, third-party control surface scripts are loaded from
 ``<User Library>/Remote Scripts/``. The similarly named
 ``Preferences/User Remote Scripts/`` folder is for legacy instant-mapping
 configurations (UserConfiguration.txt) and is NOT scanned for Python control
-surfaces — installing there is supported only as an opt-in (``--legacy``).
+surfaces; installing there is supported only as an opt-in (``--legacy``).
 """
 
 from __future__ import annotations
@@ -110,7 +110,7 @@ def _user_library_from_library_cfg(cfg: Path) -> Path | None:
 
 
 def discover_user_library_remote_script_dirs() -> list[Path]:
-    """Find ``<User Library>/Remote Scripts`` dirs — where Live (≥10.1.13)
+    """Find ``<User Library>/Remote Scripts`` dirs, where Live (≥10.1.13)
     actually loads third-party control surface scripts from.
 
     Reads the configured User Library location from each installed Live
@@ -148,7 +148,7 @@ def discover_user_library_remote_script_dirs() -> list[Path]:
 def discover_user_remote_script_dirs() -> list[Path]:
     """Find legacy 'User Remote Scripts' directories that already exist.
 
-    Live has not loaded control surface scripts from these since 10.1.13 —
+    Live has not loaded control surface scripts from these since 10.1.13;
     they hold instant-mapping configs. Kept for ``--legacy`` opt-in only, and
     limited to existing directories so no stale profile folders get created.
     """
@@ -220,7 +220,7 @@ def install_remote_script(
             elif dest.read_bytes() == src_bytes:
                 status = "unchanged"
             else:
-                # Existing file differs — may be a user's own edit, so back it up
+                # Existing file differs; may be a user's own edit, so back it up
                 backup = dest.with_suffix(".py.bak")
                 shutil.copy2(dest, backup)
                 shutil.copy2(src, dest)
@@ -233,7 +233,7 @@ def install_remote_script(
             if backup is not None:
                 detail += f"; previous version backed up to {backup.name}"
             if "User Remote Scripts" in root.parts:
-                detail += "; legacy location — not scanned by Live 10.1.13+"
+                detail += "; legacy location, not scanned by Live 10.1.13+"
 
             results.append({
                 "path": str(dest),

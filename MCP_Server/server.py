@@ -223,7 +223,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
                 start_passive_poller()
                 if not script_has_capability("drain_passive_events"):
                     logger.warning(
-                        "Passive Live listeners unavailable — Remote Script outdated "
+                        "Passive Live listeners unavailable: Remote Script outdated "
                         "or not loaded. Restart Ableton after script update."
                     )
             except Exception as e:
@@ -237,12 +237,12 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
                 if not is_telemetry_enabled():
                     reason = "telemetry disabled (config.enabled=False or DISABLE_TELEMETRY)"
                 elif not get_telemetry_consent():
-                    reason = "no dataset consent yet — the user has not opted in"
+                    reason = "no dataset consent yet; the user has not opted in"
                 else:
                     reason = "ABLETON_MCP_DISABLE_DATASET or unexpected gate failure"
             except Exception:
                 reason = "MCP_Server/config.py missing or unreadable (gitignored; required for Supabase)"
-            logger.info("Dataset recording off — %s", reason)
+            logger.info("Dataset recording off: %s", reason)
 
         yield {"script_info": script_info}
     finally:
@@ -304,7 +304,7 @@ def get_ableton_connection():
                 if data == b'':
                     raise ConnectionError("Remote end closed")
             except BlockingIOError:
-                pass  # Socket is alive, just no data waiting — this is normal
+                pass  # Socket is alive, just no data waiting, which is normal
             finally:
                 _ableton_connection.sock.setblocking(True)
             return _ableton_connection
@@ -362,8 +362,8 @@ def set_dataset_consent(ctx: Context, consent: bool, user_said: str = "") -> str
 
     Call this ONLY after the user has answered in their own words. Never infer
     the answer, never call it on their behalf, and never call it because
-    contributing seems helpful — consent the user did not give is not consent.
-    If they have not been asked yet, ask first and wait for their reply.
+    contributing seems helpful: consent the user did not give is not consent.
+    Only call this if the user raises it.
 
     Parameters:
     - consent: True if the user agreed to contribute, False if they declined
@@ -390,8 +390,8 @@ def set_dataset_consent(ctx: Context, consent: bool, user_said: str = "") -> str
 
         refresh_consent_from_dataset()
         recorder = get_recorder()
-        # Under opt-in the poller is almost never started at boot — consent did
-        # not exist yet — so a grant has to start it here or passive Live events
+        # Under opt-in the poller is almost never started at boot (consent did
+        # not exist yet), so a grant has to start it here or passive Live events
         # would be missed for the rest of the session. Idempotent and
         # self-gating, so this is safe even if startup did start it.
         from .dataset.passive_poller import start_passive_poller
@@ -410,7 +410,7 @@ def set_dataset_consent(ctx: Context, consent: bool, user_said: str = "") -> str
             f"disabled). State: {state}."
         )
     return (
-        "Thank you — this session is now being contributed to the open dataset. "
+        "Thank you. This session is now being contributed to the open dataset. "
         "Say so at any time to stop, or set ABLETON_MCP_DISABLE_DATASET=1."
     )
 
@@ -1194,7 +1194,7 @@ def create_audio_clip(ctx: Context, track_index: int, clip_index: int, path: str
     """
     Create a new audio clip in an audio track's clip slot by importing a file.
 
-    Requires Ableton Live 12.0.5 or newer — the underlying
+    Requires Ableton Live 12.0.5 or newer; the underlying
     ClipSlot.create_audio_clip Live API was introduced in 12.0.5 and is not
     available in earlier 12.0.x releases.
 
@@ -2797,7 +2797,7 @@ def record_audition(
     """
     Log a browser/preset/sample audition (keep or reject) for preference learning.
 
-    Call once per candidate auditioned. Does not load the device — use
+    Call once per candidate auditioned. Does not load the device; use
     load_instrument_or_effect when kept=True and you want to commit.
 
     Requires telemetry consent.
@@ -2876,7 +2876,7 @@ def set_track_volume(
     """
     Set a track's volume fader.
 
-    Prefer `db` — Live's fader taper is non-linear, so the raw 0..1 value is not
+    Prefer `db`: Live's fader taper is non-linear, so the raw 0..1 value is not
     proportional to level (0.85 is 0 dB, 1.0 is +6 dB). Passing `db` resolves the
     exact fader position for that level using Live's own readout.
 

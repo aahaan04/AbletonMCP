@@ -6,14 +6,14 @@ the question be asked in the chat itself, once, and remembers the answer.
 
 Three states, and the distinction matters:
 
-    UNKNOWN  — never answered. Recording is OFF. Nothing prompts for an
+    UNKNOWN:  never answered. Recording is OFF. Nothing prompts for an
                answer; the user opts in by saying so.
-    GRANTED  — the user said yes, in their own words. Recording is ON.
-    DENIED   — the user said no. Recording is OFF, permanently, and the question
+    GRANTED:  the user said yes, in their own words. Recording is ON.
+    DENIED:   the user said no. Recording is OFF, permanently, and the question
                is never asked again.
 
 Default-off for UNKNOWN makes this opt-in: nothing is recorded until the user
-actively says yes — in the chat (set_dataset_consent) or with
+actively says yes, in the chat (set_dataset_consent) or with
 ``ABLETON_MCP_ENABLE_DATASET``. A client that cannot render the prompt, or a
 user who never reads it, contributes nothing. Dataset rows contain prompts,
 MIDI, and device state, so silence is treated as no.
@@ -38,7 +38,7 @@ UNKNOWN = "unknown"
 GRANTED = "granted"
 DENIED = "denied"
 
-# Bump ONLY when what gets collected materially changes — a new category of
+# Bump ONLY when what gets collected materially changes: a new category of
 # data, not a reworded prompt. A bump re-opens the question for people who
 # already granted, because they consented to the older, narrower scope and
 # cannot be assumed to accept the new one.
@@ -92,7 +92,7 @@ def _write_state(state: dict[str, Any]) -> None:
             json.dump(state, f, indent=2)
         os.replace(tmp, _STATE_FILE)
     except Exception as e:
-        # Losing the answer means re-asking next session — annoying, not fatal.
+        # Losing the answer means re-asking next session: annoying, not fatal.
         logger.warning("Could not persist dataset consent: %s", e)
 
 
@@ -127,7 +127,7 @@ def consent_state() -> str:
         #
         # A grant written before this field existed is treated as version 1,
         # not as invalid. Those users were asked about, and agreed to, exactly
-        # the scope version 1 describes — the field's absence is our bookkeeping
+        # the scope version 1 describes; the field's absence is our bookkeeping
         # gap, not a gap in their consent, and re-asking them would be nagging.
         stored = state.get("consent_version", 1)
         if not isinstance(stored, int) or stored < CONSENT_VERSION:
@@ -138,8 +138,8 @@ def consent_state() -> str:
 def recording_allowed() -> bool:
     """True when consent permits recording. Opt-in: only GRANTED counts as yes.
 
-    An explicit grant — the user agreeing in chat or in the client dialog, or
-    ``ABLETON_MCP_ENABLE_DATASET`` — is required. Never having answered means
+    An explicit grant (the user agreeing in chat or in the client dialog, or
+    ``ABLETON_MCP_ENABLE_DATASET``) is required. Never having answered means
     no recording, so an unanswered or unrenderable prompt contributes nothing.
     """
     return consent_state() == GRANTED
@@ -172,7 +172,7 @@ def record_consent(granted: bool, quote: str | None = None) -> str:
 
 
 def needs_prompt() -> bool:
-    """True when the question is open — never answered, or answered under an
+    """True when the question is open: never answered, or answered under an
     older collection scope that has since widened."""
     return consent_state() == UNKNOWN
 

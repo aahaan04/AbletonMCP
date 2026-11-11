@@ -8,7 +8,7 @@ Two types of decorators:
 
 Both pass the user prompt and any metadata down to record_event, which drops
 them unless the rich tier has been consented to. The decorators themselves must
-not log those values — see the debug lines below.
+not log those values; see the debug lines below.
 """
 
 import functools

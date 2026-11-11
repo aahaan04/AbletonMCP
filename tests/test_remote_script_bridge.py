@@ -151,7 +151,7 @@ def _serve(script_module, chunks):
 def test_command_split_mid_utf8_character_still_parses(script_module):
     """Regression: decoding each chunk alone raised on the split, dropped the
     chunk, and wrote an error frame into a stream still awaiting the real
-    response — leaving request and response permanently out of step.
+    response, leaving request and response permanently out of step.
 
     ensure_ascii=False is what puts raw multi-byte on the wire.
     """

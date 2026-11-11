@@ -34,7 +34,7 @@ _NAME_KEYS = frozenset({"name", "clip_name", "track_name", "scene_name", "chain_
 
 # Keys whose values are filesystem locations. Every audio clip carries one
 # (see _serialize_clip_common in the Remote Script), and an absolute path
-# embeds the OS username plus the user's folder structure — the consent notice
+# embeds the OS username plus the user's folder structure, and the consent notice
 # promises these are stripped before anything leaves the machine.
 _PATH_KEYS = frozenset({"file_path", "file_path_relative", "path", "sample_path"})
 
@@ -66,7 +66,7 @@ def _scrub_name(value: Any) -> Any:
     """Keep Live defaults and generic musical labels; redact anything else.
 
     Track and clip names are the one place a snapshot picks up prose the user
-    wrote — "chorus for Sarah's wedding", client names, unreleased titles.
+    wrote: "chorus for Sarah's wedding", client names, unreleased titles.
     Length is preserved as a coarse signal, but the text does not leave the
     machine.
     """

@@ -122,7 +122,7 @@ process and its tool list until the app is fully quit. Closing the window only
 hides the app in the tray, and a new chat reuses the same server. After any
 change under `MCP_Server\`, the app's server runs old code (old tools, old
 `EXPECTED_REMOTE_SCRIPT_VERSION`) until you choose **tray icon > Quit** and
-reopen the app. On Day 5 this showed up as Claude Desktop expecting Remote
+reopen the app. In practice this showed up as Claude Desktop expecting Remote
 Script 1.10.0 with none of the new tools, while Live already had 1.11.1 loaded.
 
 After pulling or committing server code, and before an end-to-end run from

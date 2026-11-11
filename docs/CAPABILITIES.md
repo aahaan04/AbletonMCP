@@ -97,7 +97,7 @@ Remote Script commands with no MCP tool: `map_rack_magnitude`, `inspect_rack`,
 
 | Was gap | Now | How |
 |---------|-----|-----|
-| Mixer write (vol, pan, sends, mute, solo; returns; master) | ✅ | Upstream #122 merged + our mute/solo and handshake gating |
+| Mixer write (vol, pan, sends, mute, solo; returns; master) | ✅ | Upstream #122 merged + this fork's mute/solo and handshake gating |
 | Drum Rack pad access (names, notes, per-pad devices/params) | ✅ | `get_drum_pads`, nested get/set (any rack type) |
 | Delete track / device / arrangement clip | ✅ | `delete_track`, `delete_return_track`, `delete_device`, `delete_nested_device`, `delete_clip(view=...)` |
 | Connection robustness (long-command timeouts, split UTF-8, socket leaks) | ✅ | Upstream #139 merged |
@@ -143,16 +143,16 @@ Also missing, lower priority: track colour, `duplicate_track`, undo/redo, a
 3) `check_clips` for one-call verification.** Then re-run the E2E brief from Claude
 Desktop as run 2 and record any step that isn't an MCP tool call.
 
-## 3. Open upstream PRs that implement these gaps
+## 3. Upstream PRs reviewed
 
-From `gh pr list --repo ahujasid/ableton-mcp` (33 open; merging into our `dev` does not
+From `gh pr list --repo ahujasid/ableton-mcp` (33 open; merging into this fork's `dev` does not
 close them upstream). Upstream base is `9dddc7b`; none have maintainer reviews.
 
 | PR | Adds | Gaps hit | Status here | Verdict |
 |----|------|----------|-------------|---------|
 | [#139](https://github.com/ahujasid/ableton-mcp/pull/139) | Connection fixes: timeouts, split UTF-8, socket cleanup | reliability | **merged into dev** | — |
 | [#122](https://github.com/ahujasid/ableton-mcp/pull/122) | `get_mixer`, `set_track_volume` (dB), `set_track_panning`, `set_send` | mixer | **merged into dev** (+ mute/solo follow-up) | — |
-| [#140](https://github.com/ahujasid/ableton-mcp/pull/140) | All commands on Live's main thread via a bounded queue; cancel on timeout/disconnect; output meters | meters + reliability | **merged into dev** (conflicts resolved by flattening our commands into its dispatcher) | — |
+| [#140](https://github.com/ahujasid/ableton-mcp/pull/140) | All commands on Live's main thread via a bounded queue; cancel on timeout/disconnect; output meters | meters + reliability | **merged into dev** (conflicts resolved by flattening this fork's commands into its dispatcher) | — |
 | [#94](https://github.com/ahujasid/ableton-mcp/pull/94) | `create_return_track`, `duplicate_track`, `capture_midi`, `tap_tempo`, `set_track_color` | returns | **`create_return_track` ported** (authored as lukegimza); rest not taken | `duplicate_track` / `set_track_color` are small future ports. |
 | [#146](https://github.com/ahujasid/ableton-mcp/pull/146) | "Studio tools": `copy_clip`, `set_clip_properties`, sidechain, render + analysis ("ears"), skills. +11153/-167 | 3, 4, 5 | mergeable upstream; commits authored as "Claude" | **Don't merge wholesale.** Clip automation, arrangement fill/loop and grooves here were written fresh using it as a reference; do the same for sidechain and clip properties. |
 | [#119](https://github.com/ahujasid/ableton-mcp/pull/119) | Guarded mixer/device batch edits, `replace_clip_notes` with rollback | — | conflicts | Ideas only; note editing is done. |

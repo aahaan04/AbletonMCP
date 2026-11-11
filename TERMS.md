@@ -21,7 +21,7 @@ Both tiers write to a Supabase project (PostgreSQL) over HTTPS. The anon key shi
 | Default | On | **Off (opt-in)** |
 | Your content (prompts, MIDI, names) | Never | Yes |
 | Device & sound design parameters | Never | Yes |
-| Turn on | n/a | `ABLETON_MCP_ENABLE_DATASET=true`, or say yes when asked in the chat |
+| Turn on | n/a | `ABLETON_MCP_ENABLE_DATASET=true`, or raise it yourself in the chat and say yes |
 | Turn off | `ABLETON_MCP_DISABLE_TELEMETRY=true` | `ABLETON_MCP_DISABLE_DATASET=true` |
 
 **The split is content.** The anonymous tier counts installs and tool calls and carries nothing you made, so it runs by default. Everything that contains your actual work is opt-in and stays off until you say yes.
@@ -48,7 +48,7 @@ It also records **sound design state**: the full parameter set of every device o
 
 Generic musical labels (`Bass`, `Drums`, `Verse`) are kept for training signal; other names (including rack chain names) become placeholders like `<name:17>`. Emails and absolute paths are stripped from prompts and errors. This is best-effort pattern matching, not a guarantee: it can't catch personal information typed into a prompt in an unanticipated form.
 
-Recording is off by default and never starts on its own. You are asked once (as a dialog if your client supports it, otherwise as a message in the chat), and recording begins only if you say yes. An unanswered question means no, and on clients that cannot show the prompt nothing is ever recorded. Your answer is stored locally in `~/.ableton-mcp/consent.json`.
+Recording is off by default and never starts on its own. Claude never asks about it unprompted. You opt in by raising it yourself in the chat and saying yes, or by setting `ABLETON_MCP_ENABLE_DATASET=true`; until you do, nothing is recorded. Your answer is stored locally in `~/.ableton-mcp/consent.json`.
 
 Legal basis: consent, given by you before anything is recorded.
 

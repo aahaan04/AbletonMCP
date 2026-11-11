@@ -118,7 +118,7 @@ This works, but it took three discoveries the tools didn't surface.
 | 9 | `set_arrangement_time` stale readback (2.4.3) | **Low–Medium.** Misleads verification | Small | No |
 | 10 | Call count for routine steps (2.4.8) | **Low.** Slow, not blocking | Small | No |
 | 11 | `delete_track` auto-name drift (2.4.7) | **Low** | Small (docs) | No |
-| — | Saving or exporting the Set (2.4.9) | **Blocking**, but no LOM API exists; needs UI automation outside Live | Large / out of scope | — |
+| n/a | Saving or exporting the Set (2.4.9) | **Blocking**, but no LOM API exists; needs UI automation outside Live | Large / out of scope | n/a |
 
 **Planned follow-up:**
 - Ranks 1, 2, 6, 7, 8, 9 and 10 are all server-only, so they can be built and unit-tested without restarting Live.

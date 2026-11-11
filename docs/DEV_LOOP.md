@@ -96,11 +96,14 @@ Upstream PRs usually edit only `AbletonMCP_Remote_Script/__init__.py`; run
 
 ```json
 "AbletonMCP": {
-  "command": "C:\\Users\\aahaa\\.local\\bin\\uv.exe",
-  "args": ["--directory", "C:\\Users\\aahaa\\dev\\AbletonMCP", "run", "ableton-mcp"],
-  "env": { "UV_PYTHON_INSTALL_DIR": "C:\\Users\\aahaa\\.local\\share\\uv\\python" }
+  "command": "C:\\Users\\<your-user>\\.local\\bin\\uv.exe",
+  "args": ["--directory", "C:\\Users\\<your-user>\\dev\\AbletonMCP", "run", "ableton-mcp"],
+  "env": { "UV_PYTHON_INSTALL_DIR": "C:\\Users\\<your-user>\\.local\\share\\uv\\python" }
 }
 ```
+
+Replace `<your-user>` with your Windows user name (the last part of
+`%USERPROFILE%`), and the `--directory` path with wherever you cloned the repo.
 
 `UV_PYTHON_INSTALL_DIR` keeps uv's managed Python outside `%APPDATA%`. Claude
 Desktop is a packaged (MSIX) app, so its writes under `%APPDATA%` are redirected
@@ -108,8 +111,8 @@ into a private folder, which breaks the directory link uv creates there.
 
 ## Keeping Claude Desktop current
 
-`C:\Users\aahaa\dev\AbletonMCP` is the only checkout. Claude Desktop runs it,
-and all development happens in it on `dev`. Don't create other clones or
+Use a single checkout: the one Claude Desktop's `--directory` points at. Claude
+Desktop runs it, and all development happens in it on `dev`. Don't create other clones or
 worktrees for this repo. The `.venv` is an editable install that points at
 `MCP_Server\` here, so a commit takes effect as soon as the server restarts.
 `uv sync` is needed only when `pyproject.toml` dependencies change.

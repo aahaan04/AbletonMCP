@@ -1,7 +1,7 @@
 """Supabase-backed session recorder for music-creation trajectories.
 
 Enabled only when product telemetry is on *and* the user has consented
-(same gate as rich telemetry). Streams to your Supabase project — nothing
+(same gate as rich telemetry). Streams to your Supabase project; nothing
 is written to the user's disk.
 """
 
@@ -117,7 +117,7 @@ def dataset_enabled() -> bool:
     ``ABLETON_MCP_DISABLE_DATASET=1`` overrides any stored grant.
 
     This matters because dataset rows contain the user's prompts, their MIDI
-    notes, and their track and clip names — unreleased creative work. Under
+    notes, and their track and clip names: unreleased creative work. Under
     opt-in, a user who never saw the question, or whose client cannot render it,
     contributes nothing.
     """
@@ -250,7 +250,7 @@ class SessionRecorder:
             self.meta.ended_at = now_ts()
             self.meta.active_intent_id = self._active_intent_id
             # No session-row update: anon holds INSERT only, and everything the
-            # update carried is recoverable from the events themselves —
+            # update carried is recoverable from the events themselves:
             # ended_at from the session_end row below, step_count from the
             # event count, active_intent_id from the last event's intent_id.
             self._enqueue_event(
@@ -261,7 +261,7 @@ class SessionRecorder:
             )
             self._started = False
 
-        # Must happen outside the lock — the worker needs to make progress
+        # Must happen outside the lock; the worker needs to make progress
         drained = self.flush(timeout=timeout)
         try:
             self._queue.put_nowait(None)
@@ -402,7 +402,7 @@ class SessionRecorder:
             "step_id": event.step_id,
             "settled": False,
         })
-        # Bound memory — only the recent tail can still be undone
+        # Bound memory: only the recent tail can still be undone
         if len(self._recent_actions) > 200:
             self._recent_actions = self._recent_actions[-200:]
 
@@ -550,7 +550,7 @@ class SessionRecorder:
             return self._cached_state_hash
 
     def invalidate_cached_state(self) -> None:
-        """Forget the cached state hash — Live changed outside our control."""
+        """Forget the cached state hash; Live changed outside our control."""
         with self._lock:
             self._cached_state_hash = None
 
@@ -682,7 +682,7 @@ class SessionRecorder:
         """Queue a row for insert.
 
         Insert is the only supported operation. The anon key is public, so it
-        holds INSERT and nothing else — an upsert would need SELECT to resolve
+        holds INSERT and nothing else; an upsert would need SELECT to resolve
         its ON CONFLICT clause and is rejected outright. Anything an update
         would have carried is derived from the event stream at export time.
         """
@@ -696,7 +696,7 @@ class SessionRecorder:
             now = time.time()
             if now - self._last_drop_log > 10.0:
                 logger.warning(
-                    "Dataset queue full — %d rows dropped so far (writes are "
+                    "Dataset queue full: %d rows dropped so far (writes are "
                     "best-effort and never block tool calls)",
                     self._dropped,
                 )
@@ -707,7 +707,7 @@ class SessionRecorder:
             client.table(table).insert(payload["row"], returning="minimal").execute()
         except Exception as e:
             # dataset_states is unique on (session_id, state_hash) and states
-            # legitimately recur — undo an edit and you are back in a state
+            # legitimately recur: undo an edit and you are back in a state
             # already stored. The client-side hash cache absorbs most of these,
             # but it is bounded, so a repeat after eviction is expected rather
             # than an error. The stored row is identical by construction: the
@@ -769,7 +769,7 @@ class SessionRecorder:
         """Block until queued rows are written (or timeout). Returns True if drained.
 
         The worker is a daemon thread, so without this the interpreter exits
-        with the tail of the queue — including session_end — unwritten.
+        with the tail of the queue (including session_end) unwritten.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:

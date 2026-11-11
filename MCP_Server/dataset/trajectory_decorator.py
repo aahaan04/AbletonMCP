@@ -21,7 +21,7 @@ from .snapshot import fetch_snapshot
 
 logger = logging.getLogger("ableton-mcp-dataset")
 
-# Tools that change musical content — snapshot before and after. Transport and
+# Tools that change musical content: snapshot before and after. Transport and
 # view tools are excluded: their actions are still recorded, only the pre/post
 # hashes are skipped.
 MODIFYING_TOOLS = {
@@ -118,7 +118,7 @@ def _pre_cache_disabled() -> bool:
     return flag in {"1", "true", "yes", "on"}
 
 
-# Snapshots are the only dataset work on the tool's critical path — a
+# Snapshots are the only dataset work on the tool's critical path: a
 # synchronous round-trip to Live. Stop taking them if they turn slow or fail.
 _SLOW_SNAPSHOT_SEC = float(os.environ.get("ABLETON_MCP_SNAPSHOT_SLOW_SEC", "2.0"))
 _BREAKER_THRESHOLD = 3
@@ -146,7 +146,7 @@ def _breaker_record(ok: bool, elapsed: float) -> None:
             _breaker_open_until = time.time() + _BREAKER_COOLDOWN_SEC
             _breaker_strikes = 0
             logger.warning(
-                "Trajectory snapshots paused for %.0fs — snapshots were slow or "
+                "Trajectory snapshots paused for %.0fs: snapshots were slow or "
                 "failing. Tool calls are unaffected; state capture resumes after "
                 "the cooldown.",
                 _BREAKER_COOLDOWN_SEC,
@@ -244,7 +244,7 @@ def _extract_params(kwargs: dict) -> dict[str, Any]:
 
 
 def _safe_get_recorder():
-    """get_recorder() touches config/telemetry — never let that break a tool."""
+    """get_recorder() touches config/telemetry; never let that break a tool."""
     try:
         return get_recorder()
     except Exception as e:
@@ -284,7 +284,7 @@ def _take_snapshot() -> tuple[str | None, dict | None]:
         from ..server import get_ableton_connection
 
         if not script_has_capability("get_session_snapshot"):
-            logger.debug("Skipping trajectory snapshot — Remote Script lacks get_session_snapshot")
+            logger.debug("Skipping trajectory snapshot: Remote Script lacks get_session_snapshot")
             return None, None
 
         ableton = get_ableton_connection()
@@ -380,7 +380,7 @@ def trajectory_tool(tool_name: str, modifying: bool | None = None):
 
     def _finish(recorder, kwargs: dict, pre_hash, pre_hash_source,
                 start: float, success: bool, error: str | None) -> None:
-        """Shared post-call work. Never raises — recording must not break a tool."""
+        """Shared post-call work. Never raises; recording must not break a tool."""
         duration_ms = (time.time() - start) * 1000
         post_hash = None
         if modifying:
@@ -413,7 +413,7 @@ def trajectory_tool(tool_name: str, modifying: bool | None = None):
 
             Sync tool bodies run inline here, exactly as before. FastMCP calls
             sync tools directly inside the event loop coroutine, so this is the
-            same thread and the same blocking behaviour — wrapping them in an
+            same thread and the same blocking behaviour, so wrapping them in an
             async wrapper changes nothing about how they execute.
             """
             if func_is_async:
@@ -423,7 +423,7 @@ def trajectory_tool(tool_name: str, modifying: bool | None = None):
         # Always async, even around a sync tool (it used to await a consent
         # dialog; callers and tests now rely on decorated tools being
         # coroutines). functools.wraps keeps the signature, so FastMCP still
-        # injects ctx and derives the same schema — invisible to the client.
+        # injects ctx and derives the same schema, invisible to the client.
         @functools.wraps(func)
         async def wrapper(*args, **kwargs) -> Any:
             recorder = _safe_get_recorder()

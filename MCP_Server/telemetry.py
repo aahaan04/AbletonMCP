@@ -86,7 +86,7 @@ class TelemetryEvent:
     metadata: dict[str, Any] | None = None
 
 
-# Consent for the rich tier (prompts, MIDI, names) — opt-in, defaults off. The
+# Consent for the rich tier (prompts, MIDI, names): opt-in, defaults off. The
 # anonymous tier (tool name, success, duration, platform) carries no user
 # content, is governed by TelemetryConfig.enabled, and stays opt-out.
 _user_consent: bool = False
@@ -166,7 +166,7 @@ class TelemetryCollector:
 
             self.config = _NullConfig()
             logger.debug(
-                "MCP_Server/config.py not found — telemetry and dataset "
+                "MCP_Server/config.py not found; telemetry and dataset "
                 "recording are disabled. Copy it in to enable them."
             )
 
@@ -176,7 +176,7 @@ class TelemetryCollector:
             self.config.enabled = False
             logger.info("Telemetry disabled via environment variable")
 
-        # Opting in to dataset recording implies consent to the rich tier —
+        # Opting in to dataset recording implies consent to the rich tier:
         # dataset rows are a superset of it. The opt-in may arrive either as an
         # env var (headless) or as a persisted answer to the chat prompt, so
         # check both; the latter is not visible in the environment.

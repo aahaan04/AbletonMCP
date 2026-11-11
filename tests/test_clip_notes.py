@@ -2,7 +2,7 @@
 Server-side tests for the clip-notes read/clear/write loop
 (get_clip_notes, clear_notes_from_clip, add_notes_to_clip).
 These exercise the real MCP_Server.server tool functions
-with the Ableton socket connection mocked, so they run anywhere — no Ableton,
+with the Ableton socket connection mocked, so they run anywhere: no Ableton,
 no network.
 
 Run from the repo root:

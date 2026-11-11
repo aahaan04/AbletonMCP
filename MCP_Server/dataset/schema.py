@@ -2,7 +2,7 @@
 
 Training unit: (intent?, S_t, action, S_{t+1}, preference?)
 
-Product telemetry (Supabase) is separate — this schema is for local dataset recording only.
+Product telemetry (Supabase) is separate; this schema is for local dataset recording only.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class PreferenceRating(str, Enum):
 
 
 class PreferenceSource(str, Enum):
-    """Where a preference came from — filter on this when training."""
+    """Where a preference came from; filter on this when training."""
 
     HUMAN = "human"  # explicit rate_last_action / prefer_candidate call
     IMPLICIT = "implicit"  # inferred from behaviour (undo, survival)

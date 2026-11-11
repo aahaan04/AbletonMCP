@@ -104,7 +104,7 @@ def handshake(send_command) -> dict[str, Any]:
         )
     elif info.get("script_version") and info.get("script_version") != "legacy":
         logger.warning(
-            "Remote Script v%s loaded, package expects v%s — run "
+            "Remote Script v%s loaded, package expects v%s; run "
             "`ableton-mcp-install-script`, then restart Ableton.",
             info.get("script_version"),
             EXPECTED_REMOTE_SCRIPT_VERSION,
@@ -116,7 +116,7 @@ def handshake(send_command) -> dict[str, Any]:
 def require_capability(name: str, send_command=None) -> str | None:
     """Return an error message if capability missing, else None.
 
-    The startup handshake runs once, when the MCP host launches the server —
+    The startup handshake runs once, when the MCP host launches the server,
     often before Live is open. A failed or stale handshake must not lock out a
     capability for the whole session, so when ``send_command`` is given and the
     cached info lacks ``name``, re-handshake against the live Remote Script
